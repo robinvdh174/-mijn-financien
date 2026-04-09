@@ -68,6 +68,11 @@ input,select,button{outline:none;font-family:inherit;}
 .add-nav:active{transform:scale(.92);}
 @keyframes fadeIn{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:translateY(0)}}
 .save-toast{animation:fadeIn .2s ease;}
+@keyframes pinShake{0%,100%{transform:translateX(0)}20%{transform:translateX(-8px)}40%{transform:translateX(8px)}60%{transform:translateX(-6px)}80%{transform:translateX(6px)}}
+.pin-dot{width:14px;height:14px;border-radius:50%;background:#1a2744;transition:.15s;border:1px solid #334155;}
+.pin-dot.filled{background:#3b82f6;border-color:#3b82f6;}
+.pin-pad-btn{background:#0d1627;border:1px solid #1a2744;border-radius:12px;color:#e2e8f0;cursor:pointer;font-size:20px;font-weight:500;padding:16px;transition:.2s;font-family:inherit;min-height:58px;}
+.pin-pad-btn:active{background:#1e3a5f;border-color:#3b82f6;}
 </style>
 </head>
 <body>
@@ -79,11 +84,13 @@ input,select,button{outline:none;font-family:inherit;}
 </div>
 <script type="text/babel">
 /* ── React hooks ── */
-const { useState, useEffect, useCallback, useMemo } = React;
+const { useState, useEffect, useCallback, useMemo, useRef } = React;
 
 /* ── Storage keys ── */
 const KEY_TX   = "mijnfinancien_tx";
 const KEY_CATS = "mijnfinancien_cats";
+const KEY_INIT = "mijnfinancien_initialized";
+const KEY_PIN  = "mijnfinancien_pin";
 
 /* ── localStorage helpers (sync, reliable) ── */
 function storageGet(key, fallback) {
@@ -219,12 +226,136 @@ function TRow({ t, cat, onEdit, onDelete }) {
 
 const LS = { fontSize:11, color:"#475569", fontWeight:600, display:"block", marginBottom:6, textTransform:"uppercase", letterSpacing:".5px" };
 
+/* ── PIN Lock Screen ── */
+function LockScreen({ onUnlock }) {
+  const [input, setInput] = useState("");
+  const [shake, setShake] = useState(false);
+
+  const press = (d) => {
+    const next = (input + d).slice(0, 4);
+    setInput(next);
+    if (next.length === 4) {
+      setTimeout(() => {
+        const stored = storageGet(KEY_PIN, null);
+        if (stored && btoa(next) === stored) {
+          onUnlock();
+        } else {
+          setShake(true);
+          setTimeout(() => { setShake(false); setInput(""); }, 700);
+        }
+      }, 50);
+    }
+  };
+  const del = () => setInput(i => i.slice(0, -1));
+
+  return (
+    <div style={{height:"100vh",background:"#060d1a",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:28}}>
+      <div style={{textAlign:"center"}}>
+        <div style={{fontSize:42,marginBottom:10}}>{"\u{1F512}"}</div>
+        <h2 style={{fontFamily:"'DM Serif Display',serif",fontSize:22,fontWeight:400,color:"#f8fafc"}}>Mijn Financi\u00EBn</h2>
+        <p style={{fontSize:13,color:"#475569",marginTop:4}}>Voer je PIN in</p>
+      </div>
+      <div style={{display:"flex",gap:18,animation:shake?"pinShake .6s ease":"none"}}>
+        {[0,1,2,3].map(i => <div key={i} className={"pin-dot"+(input.length > i?" filled":"")} />)}
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10,width:240}}>
+        {[1,2,3,4,5,6,7,8,9].map(n => (
+          <button key={n} className="pin-pad-btn" onClick={() => press(String(n))}>{n}</button>
+        ))}
+        <div />
+        <button className="pin-pad-btn" onClick={() => press("0")}>0</button>
+        <button className="pin-pad-btn" onClick={del} style={{color:"#475569",fontSize:18}}>{"\u232B"}</button>
+      </div>
+    </div>
+  );
+}
+
+/* ── PIN Setup/Change/Remove Modal ── */
+function PinModal({ mode, onClose, onDone }) {
+  const [input, setInput] = useState("");
+  const [temp,  setTemp]  = useState("");
+  const [step,  setStep]  = useState(1);
+  const [error, setError] = useState("");
+  const [shake, setShake] = useState(false);
+
+  const doShake = (msg) => {
+    setShake(true); setError(msg);
+    setTimeout(() => { setShake(false); setInput(""); setError(""); }, 800);
+  };
+
+  const stepLabels = {
+    set:    ["Kies een PIN (4 cijfers)", "Bevestig je PIN"],
+    change: ["Huidige PIN", "Nieuwe PIN (4 cijfers)", "Bevestig nieuwe PIN"],
+    remove: ["Voer je PIN in om te verwijderen"],
+  };
+  const maxSteps = mode === "change" ? 3 : mode === "set" ? 2 : 1;
+  const label = (stepLabels[mode] || [])[step - 1] || "";
+
+  const handleComplete = (pin) => {
+    const stored = storageGet(KEY_PIN, null);
+    if (mode === "set") {
+      if (step === 1) { setTemp(pin); setStep(2); setInput(""); }
+      else if (pin === temp) { storageSet(KEY_PIN, btoa(pin)); onDone("PIN ingesteld \u2713"); }
+      else doShake("PINs komen niet overeen");
+    } else if (mode === "change") {
+      if (step === 1) {
+        if (btoa(pin) !== stored) { doShake("Onjuiste PIN"); return; }
+        setStep(2); setInput("");
+      } else if (step === 2) { setTemp(pin); setStep(3); setInput(""); }
+      else if (pin === temp) { storageSet(KEY_PIN, btoa(pin)); onDone("PIN gewijzigd \u2713"); }
+      else doShake("PINs komen niet overeen");
+    } else {
+      if (btoa(pin) !== stored) { doShake("Onjuiste PIN"); }
+      else { localStorage.removeItem(KEY_PIN); onDone("PIN verwijderd"); }
+    }
+  };
+
+  const press = (d) => {
+    const next = (input + d).slice(0, 4);
+    setInput(next);
+    if (next.length === 4) setTimeout(() => handleComplete(next), 50);
+  };
+  const del = () => setInput(i => i.slice(0, -1));
+
+  return (
+    <div className="overlay" onClick={onClose}>
+      <div className="dialog" onClick={e => e.stopPropagation()} style={{textAlign:"center",maxWidth:320}}>
+        <div style={{fontSize:28,marginBottom:8}}>{"\u{1F510}"}</div>
+        <h3 style={{fontSize:15,fontWeight:700,marginBottom:4}}>
+          {mode === "set" ? "PIN instellen" : mode === "change" ? "PIN wijzigen" : "PIN verwijderen"}
+        </h3>
+        <p style={{fontSize:12,color:"#475569",marginBottom:18}}>{label}</p>
+        {maxSteps > 1 && (
+          <div style={{display:"flex",gap:6,justifyContent:"center",marginBottom:14}}>
+            {Array.from({length:maxSteps}, (_,i) => (
+              <div key={i} style={{width:6,height:6,borderRadius:"50%",background:step > i ? "#3b82f6" : "#1a2744"}} />
+            ))}
+          </div>
+        )}
+        <div style={{display:"flex",gap:18,justifyContent:"center",marginBottom:6,animation:shake?"pinShake .6s ease":"none"}}>
+          {[0,1,2,3].map(i => <div key={i} className={"pin-dot"+(input.length > i?" filled":"")} />)}
+        </div>
+        {error && <p style={{fontSize:12,color:"#ef4444",margin:"8px 0"}}>{error}</p>}
+        <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8,margin:"16px 0"}}>
+          {[1,2,3,4,5,6,7,8,9].map(n => (
+            <button key={n} className="pin-pad-btn" onClick={() => press(String(n))}>{n}</button>
+          ))}
+          <div />
+          <button className="pin-pad-btn" onClick={() => press("0")}>0</button>
+          <button className="pin-pad-btn" onClick={del} style={{color:"#475569",fontSize:18}}>{"\u232B"}</button>
+        </div>
+        <button onClick={onClose} style={{background:"none",border:"none",color:"#475569",cursor:"pointer",fontSize:13,fontFamily:"inherit",padding:8}}>Annuleren</button>
+      </div>
+    </div>
+  );
+}
+
 /* ══════════════════════════════════════════════════════════════════════ */
 /*                          MAIN APP COMPONENT                          */
 /* ══════════════════════════════════════════════════════════════════════ */
 function App() {
   /* ── Load data synchronously from localStorage ── */
-  const initTx   = () => { const d = storageGet(KEY_TX, null);   return (Array.isArray(d) && d.length > 0) ? d : DEMO_TX; };
+  const initTx   = () => { const d = storageGet(KEY_TX, null); if (Array.isArray(d)) return d; if (storageGet(KEY_INIT, false)) return []; return DEMO_TX; };
   const initCats = () => { const d = storageGet(KEY_CATS, null); return (Array.isArray(d) && d.length > 0 && d[0].id) ? d : DEFAULT_CATS; };
 
   const [tx,       setTx]      = useState(initTx);
@@ -240,12 +371,16 @@ function App() {
   const [modal,    setModal]   = useState(null);
   const [catForm,  setCatForm] = useState({ label:"", icon:"\u{1F3F7}\uFE0F", color:"#6366f1", budget:0, isIncome:false });
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [locked,     setLocked]    = useState(() => !!storageGet(KEY_PIN, null));
+  const [pinMode,    setPinMode]   = useState(null); // "set" | "change" | "remove"
+  const [pinMsg,     setPinMsg]    = useState("");
+  const inactivityRef = useRef(null);
 
   /* ── Save helpers with visual feedback ── */
   const saveTxData = useCallback((data) => {
-    storageSet(KEY_TX, data);
-    setSaveOk(true);
-    setTimeout(() => setSaveOk(null), 1500);
+    const ok = storageSet(KEY_TX, data);
+    setSaveOk(ok ? "ok" : "err");
+    setTimeout(() => setSaveOk(null), ok ? 1500 : 5000);
   }, []);
 
   const saveCatData = useCallback((data) => {
@@ -254,6 +389,34 @@ function App() {
 
   const setAndSaveTx   = (d) => { setTx(d);   saveTxData(d);   };
   const setAndSaveCats = (d) => { setCats(d);  saveCatData(d);  };
+
+  /* ── Multi-tab sync: sync state when another tab writes to localStorage ── */
+  useEffect(() => {
+    const onStorage = (e) => {
+      if (e.key === KEY_TX   && e.newValue) { try { setTx(JSON.parse(e.newValue));   } catch {} }
+      if (e.key === KEY_CATS && e.newValue) { try { setCats(JSON.parse(e.newValue)); } catch {} }
+    };
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
+  }, []);
+
+  /* ── Auto-lock after 5 minutes inactivity ── */
+  const resetInactivity = useCallback(() => {
+    clearTimeout(inactivityRef.current);
+    if (storageGet(KEY_PIN, null)) {
+      inactivityRef.current = setTimeout(() => setLocked(true), 5 * 60 * 1000);
+    }
+  }, []);
+
+  useEffect(() => {
+    const evts = ["mousemove","keydown","touchstart","click","scroll"];
+    evts.forEach(ev => window.addEventListener(ev, resetInactivity, { passive:true }));
+    resetInactivity();
+    return () => {
+      evts.forEach(ev => window.removeEventListener(ev, resetInactivity));
+      clearTimeout(inactivityRef.current);
+    };
+  }, [resetInactivity]);
 
   /* ── Category helpers ── */
   const getCat      = (id) => cats.find(c => c.id === id) || { id:"overig", label:"Overig", icon:"\u{1F4E6}", color:"#94a3b8", budget:100, isIncome:false };
@@ -273,8 +436,10 @@ function App() {
   };
 
   const deleteCat = (id) => {
-    setAndSaveCats(cats.filter(c => c.id !== id));
-    setAndSaveTx(tx.map(t => t.category === id ? { ...t, category:"overig" } : t));
+    const newCats = cats.filter(c => c.id !== id);
+    const newTx   = tx.map(t => t.category === id ? { ...t, category:"overig" } : t);
+    setCats(newCats); saveCatData(newCats);
+    setTx(newTx);     saveTxData(newTx);
   };
 
   /* ── Transaction helpers ── */
@@ -288,7 +453,7 @@ function App() {
       setAndSaveTx(tx.map(t => t.id === editId ? { ...t, ...entry } : t));
       setEditId(null);
     } else {
-      setAndSaveTx([...tx, { id:Date.now(), ...entry }]);
+      setAndSaveTx([...tx, { id:crypto.randomUUID(), ...entry }]);
     }
     setForm(blankForm());
     setView("transacties");
@@ -323,8 +488,15 @@ function App() {
     reader.onload = (ev) => {
       try {
         const data = JSON.parse(ev.target.result);
-        if (data.transactions && Array.isArray(data.transactions)) setAndSaveTx(data.transactions);
+        if (!data.transactions || !Array.isArray(data.transactions)) {
+          alert("Ongeldig bestand: geen transacties gevonden.");
+          return;
+        }
+        const count = data.transactions.length;
+        if (!confirm(`Dit bestand bevat ${count} transacties.\n\nJouw huidige ${tx.length} transacties worden VERVANGEN.\n\nWeet je zeker dat je wil importeren?`)) return;
+        setAndSaveTx(data.transactions);
         if (data.categories && Array.isArray(data.categories)) setAndSaveCats(data.categories);
+        storageSet(KEY_INIT, true);
         setSettingsOpen(false);
       } catch(err) {
         alert("Ongeldig bestand: " + err.message);
@@ -335,6 +507,7 @@ function App() {
 
   const clearAllData = () => {
     if (confirm("Weet je zeker dat je ALLE gegevens wilt wissen? Dit kan niet ongedaan worden gemaakt.")) {
+      storageSet(KEY_INIT, true);
       setAndSaveTx([]);
       setAndSaveCats(DEFAULT_CATS);
       setSettingsOpen(false);
@@ -403,8 +576,19 @@ function App() {
   const formCats = form.type === "uitgave" ? expenseCats : incomeCats;
 
   /* ── RENDER ── */
+  if (locked) return <LockScreen onUnlock={() => { setLocked(false); resetInactivity(); }} />;
+
   return (
     <div style={{height:"100vh",display:"flex",flexDirection:"column",overflow:"hidden"}}>
+
+      {/* PIN Modal */}
+      {pinMode && (
+        <PinModal
+          mode={pinMode}
+          onClose={() => setPinMode(null)}
+          onDone={(msg) => { setPinMode(null); setPinMsg(msg); setTimeout(() => setPinMsg(""), 3000); }}
+        />
+      )}
 
       {/* Delete confirmation dialog */}
       {delConf && (
@@ -486,6 +670,21 @@ function App() {
           <div className="dialog" onClick={e=>e.stopPropagation()}>
             <h3 style={{fontSize:15,fontWeight:700,marginBottom:16}}>Instellingen</h3>
             <div style={{display:"flex",flexDirection:"column",gap:10}}>
+              {/* PIN section */}
+              <div style={{background:"#060d1a",border:"1px solid #1a2744",borderRadius:9,padding:"10px 12px"}}>
+                <div style={{fontSize:10,color:"#475569",fontWeight:700,textTransform:"uppercase",letterSpacing:".5px",marginBottom:8}}>{"\u{1F512}"} Beveiliging</div>
+                {pinMsg && <div style={{fontSize:12,color:"#22c55e",marginBottom:8}}>{pinMsg}</div>}
+                {storageGet(KEY_PIN, null) ? (
+                  <div style={{display:"flex",gap:6}}>
+                    <button onClick={()=>{setSettingsOpen(false);setPinMode("change");}} style={{flex:1,background:"#1a2744",border:"none",borderRadius:7,color:"#e2e8f0",cursor:"pointer",padding:"9px 6px",fontSize:12,fontFamily:"inherit"}}>PIN wijzigen</button>
+                    <button onClick={()=>{setSettingsOpen(false);setPinMode("remove");}} style={{flex:1,background:"#7f1d1d22",border:"1px solid #7f1d1d",borderRadius:7,color:"#ef4444",cursor:"pointer",padding:"9px 6px",fontSize:12,fontFamily:"inherit"}}>PIN verwijderen</button>
+                  </div>
+                ) : (
+                  <button onClick={()=>{setSettingsOpen(false);setPinMode("set");}} style={{width:"100%",background:"linear-gradient(135deg,#1e3a5f,#1a2744)",border:"1px solid #3b82f6",borderRadius:7,color:"#60a5fa",cursor:"pointer",padding:"9px",fontSize:13,fontFamily:"inherit",textAlign:"left"}}>
+                    + PIN instellen (aanbevolen)
+                  </button>
+                )}
+              </div>
               <button onClick={exportData} style={{background:"#1a2744",border:"none",borderRadius:9,color:"#e2e8f0",cursor:"pointer",padding:"12px",fontSize:14,fontFamily:"inherit",textAlign:"left"}}>
                 {"\u{1F4E5}"} Exporteer gegevens (JSON)
               </button>
@@ -515,15 +714,27 @@ function App() {
                 Saldo: <span style={{color:totSaldo>=0?"#22c55e":"#ef4444",fontWeight:700}}>{fmt(totSaldo)}</span>
               </p>
             </div>
-            {saveOk && (
+            {saveOk === "ok" && (
               <span className="save-toast" style={{fontSize:11,color:"#22c55e",background:"#052e16",border:"1px solid #14532d",borderRadius:20,padding:"3px 10px"}}>
                 {"\u2713"} Opgeslagen
               </span>
             )}
+            {saveOk === "err" && (
+              <span className="save-toast" style={{fontSize:11,color:"#ef4444",background:"#450a0a",border:"1px solid #7f1d1d",borderRadius:20,padding:"3px 10px"}}>
+                {"\u26A0\uFE0F"} Opslaan mislukt!
+              </span>
+            )}
           </div>
-          <button onClick={()=>setSettingsOpen(true)} style={{background:"none",border:"1px solid #1a2744",borderRadius:9,cursor:"pointer",padding:"8px 10px",fontSize:16,color:"#475569",minWidth:40,minHeight:40,display:"flex",alignItems:"center",justifyContent:"center"}}>
-            {"\u2699\uFE0F"}
-          </button>
+          <div style={{display:"flex",gap:6}}>
+            {storageGet(KEY_PIN, null) && (
+              <button onClick={()=>setLocked(true)} title="Vergrendelen" style={{background:"none",border:"1px solid #1a2744",borderRadius:9,cursor:"pointer",padding:"8px 10px",fontSize:16,color:"#475569",minWidth:40,minHeight:40,display:"flex",alignItems:"center",justifyContent:"center"}}>
+                {"\u{1F512}"}
+              </button>
+            )}
+            <button onClick={()=>setSettingsOpen(true)} style={{background:"none",border:"1px solid #1a2744",borderRadius:9,cursor:"pointer",padding:"8px 10px",fontSize:16,color:"#475569",minWidth:40,minHeight:40,display:"flex",alignItems:"center",justifyContent:"center"}}>
+              {"\u2699\uFE0F"}
+            </button>
+          </div>
         </div>
       </div>
 
