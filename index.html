@@ -243,9 +243,9 @@ function App() {
 
   /* ── Save helpers with visual feedback ── */
   const saveTxData = useCallback((data) => {
-    storageSet(KEY_TX, data);
-    setSaveOk(true);
-    setTimeout(() => setSaveOk(null), 1500);
+    const ok = storageSet(KEY_TX, data);
+    setSaveOk(ok ? "ok" : "err");
+    setTimeout(() => setSaveOk(null), 2000);
   }, []);
 
   const saveCatData = useCallback((data) => {
@@ -273,8 +273,9 @@ function App() {
   };
 
   const deleteCat = (id) => {
+    const fallbackId = cats.find(c => c.id !== id && !c.isIncome)?.id || "overig";
     setAndSaveCats(cats.filter(c => c.id !== id));
-    setAndSaveTx(tx.map(t => t.category === id ? { ...t, category:"overig" } : t));
+    setAndSaveTx(tx.map(t => t.category === id ? { ...t, category: fallbackId } : t));
   };
 
   /* ── Transaction helpers ── */
@@ -288,7 +289,7 @@ function App() {
       setAndSaveTx(tx.map(t => t.id === editId ? { ...t, ...entry } : t));
       setEditId(null);
     } else {
-      setAndSaveTx([...tx, { id:Date.now(), ...entry }]);
+      setAndSaveTx([...tx, { id:Date.now()+"_"+Math.random().toString(36).slice(2,5), ...entry }]);
     }
     setForm(blankForm());
     setView("transacties");
@@ -323,8 +324,19 @@ function App() {
     reader.onload = (ev) => {
       try {
         const data = JSON.parse(ev.target.result);
-        if (data.transactions && Array.isArray(data.transactions)) setAndSaveTx(data.transactions);
-        if (data.categories && Array.isArray(data.categories)) setAndSaveCats(data.categories);
+        if (data.transactions && Array.isArray(data.transactions)) {
+          const validTx = data.transactions.filter(t =>
+            t.id != null && t.date && typeof t.amount === "number" &&
+            t.description && t.category
+          );
+          setAndSaveTx(validTx);
+          if (validTx.length < data.transactions.length)
+            alert(`${validTx.length} van ${data.transactions.length} transacties geladen (ongeldige overgeslagen).`);
+        }
+        if (data.categories && Array.isArray(data.categories)) {
+          const validCats = data.categories.filter(c => c.id && c.label);
+          setAndSaveCats(validCats);
+        }
         setSettingsOpen(false);
       } catch(err) {
         alert("Ongeldig bestand: " + err.message);
@@ -516,8 +528,8 @@ function App() {
               </p>
             </div>
             {saveOk && (
-              <span className="save-toast" style={{fontSize:11,color:"#22c55e",background:"#052e16",border:"1px solid #14532d",borderRadius:20,padding:"3px 10px"}}>
-                {"\u2713"} Opgeslagen
+              <span className="save-toast" style={{fontSize:11,color:saveOk==="ok"?"#22c55e":"#ef4444",background:saveOk==="ok"?"#052e16":"#450a0a",border:"1px solid "+(saveOk==="ok"?"#14532d":"#7f1d1d"),borderRadius:20,padding:"3px 10px"}}>
+                {saveOk==="ok" ? "\u2713 Opgeslagen" : "\u26A0\uFE0F Opslaan mislukt"}
               </span>
             )}
           </div>
