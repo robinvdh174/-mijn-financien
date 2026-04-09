@@ -344,6 +344,21 @@ function App() {
     URL.revokeObjectURL(url);
   };
 
+  const exportCSV = () => {
+    const header = "Datum,Omschrijving,Categorie,Bedrag\n";
+    const rows   = [...tx]
+      .sort((a,b) => b.date.localeCompare(a.date))
+      .map(t => `${t.date},"${t.description.replace(/"/g,'""')}","${getCat(t.category).label}",${t.amount}`)
+      .join("\n");
+    const blob = new Blob(["\uFEFF"+header+rows], { type:"text/csv;charset=utf-8" });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement("a");
+    a.href = url;
+    a.download = "financien-"+new Date().toISOString().slice(0,10)+".csv";
+    document.body.appendChild(a); a.click();
+    document.body.removeChild(a); URL.revokeObjectURL(url);
+  };
+
   const importData = (e) => {
     const file = e.target.files[0];
     if (!file) return;
@@ -390,6 +405,18 @@ function App() {
   const monthNt      = monthIn - monthUt;
   const spaar        = monthIn > 0 ? Math.round((monthNt/monthIn)*100) : 0;
   const totSaldo     = useMemo(() => tx.reduce((s,t)=>s+t.amount,0), [tx]);
+
+  /* ── Vorige maand vergelijking ── */
+  const prevMonthKey = useMemo(() => {
+    const [yr, mo] = activeMonth.split("-").map(Number);
+    const d = new Date(yr, mo - 2, 1);
+    return d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0");
+  }, [activeMonth]);
+  const prevTs    = useMemo(() => tx.filter(t => t.date.startsWith(prevMonthKey)), [tx, prevMonthKey]);
+  const prevIn    = useMemo(() => Math.round(prevTs.filter(t=>t.amount>0).reduce((s,t)=>s+t.amount,0)*100)/100, [prevTs]);
+  const prevUt    = useMemo(() => Math.round(prevTs.filter(t=>t.amount<0).reduce((s,t)=>s+Math.abs(t.amount),0)*100)/100, [prevTs]);
+  const prevNt    = prevIn - prevUt;
+  const prevSpaar = prevIn > 0 ? Math.round((prevNt/prevIn)*100) : 0;
 
   const biggestExpense = useMemo(() => {
     const ex = tx.filter(t=>t.amount<0);
@@ -528,6 +555,9 @@ function App() {
               <button onClick={exportData} style={{background:"#1a2744",border:"none",borderRadius:9,color:"#e2e8f0",cursor:"pointer",padding:"12px",fontSize:14,fontFamily:"inherit",textAlign:"left"}}>
                 {"\u{1F4E5}"} Exporteer gegevens (JSON)
               </button>
+              <button onClick={exportCSV} style={{background:"#1a2744",border:"none",borderRadius:9,color:"#e2e8f0",cursor:"pointer",padding:"12px",fontSize:14,fontFamily:"inherit",textAlign:"left"}}>
+                {"\u{1F4CA}"} Exporteer als CSV (Excel)
+              </button>
               <label style={{background:"#1a2744",borderRadius:9,color:"#e2e8f0",cursor:"pointer",padding:"12px",fontSize:14,fontFamily:"inherit",textAlign:"left",display:"block"}}>
                 {"\u{1F4E4}"} Importeer gegevens
                 <input type="file" accept=".json" onChange={importData} style={{display:"none"}} />
@@ -586,10 +616,10 @@ function App() {
           <div style={{display:"flex",flexDirection:"column",gap:12}}>
             <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
               {[
-                {lbl:"Inkomen",    val:fmt(monthIn), color:"#22c55e", icon:"\u{1F4C8}"},
-                {lbl:"Uitgaven",   val:fmt(monthUt), color:"#ef4444", icon:"\u{1F4C9}"},
-                {lbl:"Netto",      val:fmt(monthNt), color:monthNt>=0?"#60a5fa":"#f87171", icon:"\u2696\uFE0F"},
-                {lbl:"Spaarquote", val:spaar+"%",    color:spaar>=20?"#22c55e":spaar>=10?"#f59e0b":"#ef4444", icon:"\u{1F437}"},
+                {lbl:"Inkomen",    val:fmt(monthIn), color:"#22c55e", icon:"\u{1F4C8}", delta:prevIn>0?Math.round(((monthIn-prevIn)/prevIn)*100):null, deltaGoed:true,  absoluut:false},
+                {lbl:"Uitgaven",   val:fmt(monthUt), color:"#ef4444", icon:"\u{1F4C9}", delta:prevUt>0?Math.round(((monthUt-prevUt)/prevUt)*100):null, deltaGoed:false, absoluut:false},
+                {lbl:"Netto",      val:fmt(monthNt), color:monthNt>=0?"#60a5fa":"#f87171", icon:"\u2696\uFE0F", delta:(prevIn>0||prevUt>0)?(monthNt-prevNt):null, deltaGoed:true, absoluut:true},
+                {lbl:"Spaarquote", val:spaar+"%",    color:spaar>=20?"#22c55e":spaar>=10?"#f59e0b":"#ef4444",   icon:"\u{1F437}",  delta:prevIn>0?(spaar-prevSpaar):null, deltaGoed:true, absoluut:true},
               ].map(k=>(
                 <div key={k.lbl} className="card" style={{padding:"12px 14px"}}>
                   <div style={{display:"flex",justifyContent:"space-between",marginBottom:4}}>
@@ -598,6 +628,11 @@ function App() {
                   </div>
                   <div style={{fontSize:18,fontWeight:700,color:k.color,fontFamily:"'DM Serif Display',serif"}}>{k.val}</div>
                   <div style={{fontSize:10,color:"#334155",marginTop:2}}>{monthLabel(fMonth)}</div>
+                  {k.delta!==null && k.delta!==undefined && (
+                    <div style={{fontSize:9,marginTop:2,color:(k.deltaGoed?(k.delta>0):(k.delta<0))?"#22c55e":"#f87171"}}>
+                      {k.delta>0?"▲":"▼"}{k.absoluut?(k.delta>0?"+":"")+fmt(k.delta):Math.abs(k.delta)+"%"} vs vorige maand
+                    </div>
+                  )}
                 </div>
               ))}
             </div>
@@ -769,6 +804,7 @@ function App() {
                   </div>
                   <div style={{display:"flex",alignItems:"center",gap:6}}>
                     {c.over && <span className="tag" style={{background:"#7f1d1d22",color:"#ef4444",border:"1px solid #7f1d1d44",fontSize:10}}>Over</span>}
+                    {!c.over && c.pct>80 && <span className="tag" style={{background:"#78350f22",color:"#f59e0b",border:"1px solid #78350f44",fontSize:10}}>Bijna vol</span>}
                     <span style={{fontSize:14,fontWeight:700,color:c.over?"#ef4444":c.pct>80?"#f59e0b":"#22c55e"}}>{c.pct}%</span>
                     <button className="rb" onClick={()=>openEditCat(c)}>&#9998;</button>
                   </div>
