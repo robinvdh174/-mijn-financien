@@ -224,8 +224,8 @@ const LS = { fontSize:11, color:"#475569", fontWeight:600, display:"block", marg
 /* ══════════════════════════════════════════════════════════════════════ */
 function App() {
   /* ── Load data synchronously from localStorage ── */
-  const initTx   = () => { const d = storageGet(KEY_TX, null);   return (Array.isArray(d) && d.length > 0) ? d : DEMO_TX; };
-  const initCats = () => { const d = storageGet(KEY_CATS, null); return (Array.isArray(d) && d.length > 0 && d[0].id) ? d : DEFAULT_CATS; };
+  const initTx   = () => { const d = storageGet(KEY_TX, null);   return Array.isArray(d) ? d : DEMO_TX; };
+  const initCats = () => { const d = storageGet(KEY_CATS, null); return (Array.isArray(d) && d.length > 0) ? d : DEFAULT_CATS; };
 
   const [tx,       setTx]      = useState(initTx);
   const [cats,     setCats]    = useState(initCats);
