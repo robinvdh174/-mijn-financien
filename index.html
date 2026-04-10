@@ -82,8 +82,9 @@ input,select,button{outline:none;font-family:inherit;}
 const { useState, useEffect, useCallback, useMemo } = React;
 
 /* ── Storage keys ── */
-const KEY_TX   = "mijnfinancien_tx";
-const KEY_CATS = "mijnfinancien_cats";
+const KEY_TX     = "mijnfinancien_tx";
+const KEY_CATS   = "mijnfinancien_cats";
+const KEY_SEEDED = "mijnfinancien_seeded"; // set after first real save; distinguishes "cleared" from "never used"
 
 /* ── localStorage helpers (sync, reliable) ── */
 function storageGet(key, fallback) {
@@ -103,6 +104,33 @@ function storageSet(key, val) {
     console.error("Storage write error:", e);
     return false;
   }
+}
+
+/* ── IndexedDB backup (survives iOS localStorage eviction) ── */
+const IDB_NAME = "mijnfinancien", IDB_STORE = "kv", IDB_VERSION = 1;
+function idbOpen() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(IDB_NAME, IDB_VERSION);
+    req.onupgradeneeded = e => e.target.result.createObjectStore(IDB_STORE);
+    req.onsuccess = e => resolve(e.target.result);
+    req.onerror   = e => reject(e.target.error);
+  });
+}
+function idbGet(key) {
+  return idbOpen().then(db => new Promise((resolve, reject) => {
+    const t = db.transaction(IDB_STORE, "readonly");
+    const r = t.objectStore(IDB_STORE).get(key);
+    r.onsuccess = e => resolve(e.target.result ?? null);
+    r.onerror   = e => reject(e.target.error);
+  })).catch(() => null);
+}
+function idbSet(key, val) {
+  return idbOpen().then(db => new Promise((resolve, reject) => {
+    const t = db.transaction(IDB_STORE, "readwrite");
+    const r = t.objectStore(IDB_STORE).put(val, key);
+    r.onsuccess = () => resolve(true);
+    r.onerror   = e => reject(e.target.error);
+  })).catch(() => false);
 }
 
 /* ── Default categories ── */
@@ -224,7 +252,11 @@ const LS = { fontSize:11, color:"#475569", fontWeight:600, display:"block", marg
 /* ══════════════════════════════════════════════════════════════════════ */
 function App() {
   /* ── Load data synchronously from localStorage ── */
-  const initTx   = () => { const d = storageGet(KEY_TX, null);   return (Array.isArray(d) && d.length > 0) ? d : DEMO_TX; };
+  const initTx = () => {
+    if (!storageGet(KEY_SEEDED, false)) return DEMO_TX;   // genuine first run → show demo
+    const d = storageGet(KEY_TX, null);
+    return Array.isArray(d) ? d : DEMO_TX;                 // [] is valid cleared state
+  };
   const initCats = () => { const d = storageGet(KEY_CATS, null); return (Array.isArray(d) && d.length > 0 && d[0].id) ? d : DEFAULT_CATS; };
 
   const [tx,       setTx]      = useState(initTx);
@@ -240,16 +272,51 @@ function App() {
   const [modal,    setModal]   = useState(null);
   const [catForm,  setCatForm] = useState({ label:"", icon:"\u{1F3F7}\uFE0F", color:"#6366f1", budget:0, isIncome:false });
   const [settingsOpen, setSettingsOpen] = useState(false);
+  // appReady: true when we know localStorage is intact; false while we check IndexedDB for recovery
+  const [appReady, setAppReady] = useState(() => !!storageGet(KEY_SEEDED, false));
+
+  /* ── IndexedDB recovery: fires once on mount ──
+     If iOS cleared localStorage but IndexedDB survived, restore user data from IDB.
+     If localStorage is intact, mirror data to IDB as backup (fire-and-forget). */
+  useEffect(() => {
+    const seededLS = storageGet(KEY_SEEDED, false);
+    if (seededLS) {
+      idbSet(KEY_SEEDED, true);
+      idbSet(KEY_TX,   storageGet(KEY_TX, []));
+      idbSet(KEY_CATS, storageGet(KEY_CATS, DEFAULT_CATS));
+      setAppReady(true);
+      return;
+    }
+    // localStorage is empty — check IDB for real user data (iOS may have wiped localStorage)
+    Promise.all([idbGet(KEY_SEEDED), idbGet(KEY_TX), idbGet(KEY_CATS)])
+      .then(([seededIdb, txIdb, catsIdb]) => {
+        if (seededIdb && Array.isArray(txIdb)) {
+          storageSet(KEY_SEEDED, true);
+          storageSet(KEY_TX, txIdb);
+          setTx(txIdb);
+          if (Array.isArray(catsIdb) && catsIdb.length > 0 && catsIdb[0].id) {
+            storageSet(KEY_CATS, catsIdb);
+            setCats(catsIdb);
+          }
+        }
+        setAppReady(true);
+      })
+      .catch(() => setAppReady(true));
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   /* ── Save helpers with visual feedback ── */
   const saveTxData = useCallback((data) => {
+    storageSet(KEY_SEEDED, true);
     storageSet(KEY_TX, data);
+    idbSet(KEY_SEEDED, true);  // mirror to IDB backup
+    idbSet(KEY_TX, data);
     setSaveOk(true);
     setTimeout(() => setSaveOk(null), 1500);
   }, []);
 
   const saveCatData = useCallback((data) => {
     storageSet(KEY_CATS, data);
+    idbSet(KEY_CATS, data);    // mirror to IDB backup
   }, []);
 
   const setAndSaveTx   = (d) => { setTx(d);   saveTxData(d);   };
@@ -403,6 +470,14 @@ function App() {
   const formCats = form.type === "uitgave" ? expenseCats : incomeCats;
 
   /* ── RENDER ── */
+  if (!appReady) {
+    return (
+      <div style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",height:"100vh",background:"#060d1a",color:"#475569",gap:12}}>
+        <div style={{fontSize:32}}>{"\u{1F4B0}"}</div>
+        <div style={{fontSize:13}}>Laden...</div>
+      </div>
+    );
+  }
   return (
     <div style={{height:"100vh",display:"flex",flexDirection:"column",overflow:"hidden"}}>
 
@@ -497,7 +572,7 @@ function App() {
                 {"\u{1F5D1}\uFE0F"} Wis alle gegevens
               </button>
               <div style={{fontSize:11,color:"#334155",marginTop:4,lineHeight:1.5}}>
-                Je gegevens worden lokaal opgeslagen op dit toestel. Maak regelmatig een backup via exporteren.
+                {"\uD83D\uDD12"} Je gegevens worden <strong style={{color:"#475569"}}>uitsluitend lokaal</strong> opgeslagen op dit toestel — er worden <strong style={{color:"#475569"}}>geen gegevens naar internet verstuurd</strong>. Maak regelmatig een backup via exporteren.
               </div>
             </div>
             <button onClick={()=>setSettingsOpen(false)} style={{width:"100%",background:"#1a2744",border:"none",borderRadius:9,color:"#94a3b8",cursor:"pointer",padding:"11px",fontSize:14,fontFamily:"inherit",marginTop:14}}>Sluiten</button>
