@@ -82,27 +82,67 @@ input,select,button{outline:none;font-family:inherit;}
 const { useState, useEffect, useCallback, useMemo } = React;
 
 /* ── Storage keys ── */
-const KEY_TX   = "mijnfinancien_tx";
-const KEY_CATS = "mijnfinancien_cats";
+const KEY_BLOB  = "mijnfinancien_blob";   // versleutelde payload (transacties + categorieën)
+const KEY_SALT  = "mijnfinancien_salt";   // PBKDF2 salt (base64)
+const KEY_CHECK = "mijnfinancien_check";  // versleutelde validatie-string ("ok") voor PIN-check
+const KEY_INIT  = "mijnfinancien_init";   // vlag: eerste setup voltooid
+const PBKDF2_ITER = 250000;
+const CHECK_PLAINTEXT = "mijnfinancien_ok";
 
-/* ── localStorage helpers (sync, reliable) ── */
-function storageGet(key, fallback) {
-  try {
-    const val = localStorage.getItem(key);
-    return val ? JSON.parse(val) : fallback;
-  } catch(e) {
-    console.warn("Storage read error:", e);
-    return fallback;
-  }
+/* ── Base64 helpers ── */
+function b64encode(bytes) {
+  let s = "";
+  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+  return btoa(s);
 }
-function storageSet(key, val) {
-  try {
-    localStorage.setItem(key, JSON.stringify(val));
-    return true;
-  } catch(e) {
-    console.error("Storage write error:", e);
-    return false;
-  }
+function b64decode(str) {
+  const s = atob(str);
+  const out = new Uint8Array(s.length);
+  for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i);
+  return out;
+}
+function randomBytes(n) {
+  const b = new Uint8Array(n);
+  crypto.getRandomValues(b);
+  return b;
+}
+
+/* ── Web Crypto: PBKDF2 → AES-GCM ── */
+async function deriveKey(pin, saltBytes) {
+  const enc = new TextEncoder();
+  const baseKey = await crypto.subtle.importKey(
+    "raw", enc.encode(pin), { name:"PBKDF2" }, false, ["deriveKey"]
+  );
+  return crypto.subtle.deriveKey(
+    { name:"PBKDF2", salt:saltBytes, iterations:PBKDF2_ITER, hash:"SHA-256" },
+    baseKey,
+    { name:"AES-GCM", length:256 },
+    false,
+    ["encrypt","decrypt"]
+  );
+}
+async function encryptString(key, plaintext) {
+  const iv = randomBytes(12);
+  const ct = await crypto.subtle.encrypt(
+    { name:"AES-GCM", iv },
+    key,
+    new TextEncoder().encode(plaintext)
+  );
+  return { iv:b64encode(iv), ct:b64encode(new Uint8Array(ct)) };
+}
+async function decryptString(key, blob) {
+  const pt = await crypto.subtle.decrypt(
+    { name:"AES-GCM", iv:b64decode(blob.iv) },
+    key,
+    b64decode(blob.ct)
+  );
+  return new TextDecoder().decode(pt);
+}
+async function encryptJSON(key, obj) {
+  return encryptString(key, JSON.stringify(obj));
+}
+async function decryptJSON(key, blob) {
+  return JSON.parse(await decryptString(key, blob));
 }
 
 /* ── Default categories ── */
@@ -127,23 +167,6 @@ const fmt     = (n) => new Intl.NumberFormat("nl-BE",{style:"currency",currency:
 const fmtDate = (iso) => new Date(iso).toLocaleDateString("nl-BE",{day:"2-digit",month:"short",year:"numeric"});
 const nowKey  = () => { const d=new Date(); return d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0"); };
 const uid     = () => "cat_"+Date.now()+"_"+Math.random().toString(36).slice(2,6);
-
-const DEMO_TX = [
-  {id:1,  date:"2026-03-01",description:"Loon maart",         category:"inkomen",      amount: 3200  },
-  {id:2,  date:"2026-03-02",description:"Huur",               category:"wonen",        amount: -850  },
-  {id:3,  date:"2026-03-05",description:"Delhaize",           category:"boodschappen", amount: -92.4 },
-  {id:4,  date:"2026-03-07",description:"Tankbeurt",          category:"transport",    amount: -78.6 },
-  {id:5,  date:"2026-03-10",description:"Luminus energie",    category:"energie",      amount: -134  },
-  {id:6,  date:"2026-03-12",description:"Restaurant De Hoek", category:"horeca",       amount: -43   },
-  {id:7,  date:"2026-03-15",description:"Netflix + Spotify",  category:"abonnementen", amount: -22.98},
-  {id:8,  date:"2026-03-18",description:"Apotheek",           category:"gezondheid",   amount: -31.5 },
-  {id:9,  date:"2026-03-20",description:"Colruyt",            category:"boodschappen", amount: -67.2 },
-  {id:10, date:"2026-03-25",description:"Boardgame",          category:"hobby",        amount: -54   },
-  {id:11, date:"2026-04-01",description:"Loon april",         category:"inkomen",      amount: 3200  },
-  {id:12, date:"2026-04-02",description:"Huur",               category:"wonen",        amount: -850  },
-  {id:13, date:"2026-04-03",description:"Aldi",               category:"boodschappen", amount: -55.3 },
-  {id:14, date:"2026-04-04",description:"Treinticket",        category:"transport",    amount: -28   },
-];
 
 function blankForm() {
   return { date:new Date().toISOString().slice(0,10), description:"", category:"overig", amount:"", type:"uitgave" };
@@ -219,16 +242,159 @@ function TRow({ t, cat, onEdit, onDelete }) {
 
 const LS = { fontSize:11, color:"#475569", fontWeight:600, display:"block", marginBottom:6, textTransform:"uppercase", letterSpacing:".5px" };
 
+/* ── Lockscreen: first-run PIN setup ── */
+function PinSetup({ onComplete }) {
+  const [pin, setPin] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const submit = async () => {
+    setErr("");
+    if (pin.length < 4) { setErr("PIN moet minstens 4 cijfers zijn"); return; }
+    if (pin !== confirm) { setErr("PIN's komen niet overeen"); return; }
+    setBusy(true);
+    try {
+      await onComplete(pin);
+    } catch(e) {
+      setErr(e.message || "Setup mislukt");
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div style={{height:"100vh",display:"flex",alignItems:"center",justifyContent:"center",padding:"24px",background:"#060d1a"}}>
+      <div className="card" style={{padding:24,maxWidth:360,width:"100%"}}>
+        <div style={{textAlign:"center",marginBottom:18}}>
+          <div style={{fontSize:38,marginBottom:6}}>{"\u{1F510}"}</div>
+          <h2 style={{fontFamily:"'DM Serif Display',serif",fontSize:22,fontWeight:400,color:"#f8fafc"}}>Stel een PIN in</h2>
+          <p style={{fontSize:12,color:"#475569",marginTop:6,lineHeight:1.5}}>Je gegevens worden versleuteld opgeslagen op dit toestel. Zonder je PIN is niets leesbaar.</p>
+        </div>
+        <div style={{display:"flex",flexDirection:"column",gap:12}}>
+          <div>
+            <label style={LS}>Nieuwe PIN (min. 4 cijfers)</label>
+            <input className="fi" type="password" inputMode="numeric" pattern="[0-9]*" autoComplete="new-password" value={pin} onChange={e=>setPin(e.target.value)} placeholder="\u2022\u2022\u2022\u2022"/>
+          </div>
+          <div>
+            <label style={LS}>Bevestig PIN</label>
+            <input className="fi" type="password" inputMode="numeric" pattern="[0-9]*" autoComplete="new-password" value={confirm} onChange={e=>setConfirm(e.target.value)} placeholder="\u2022\u2022\u2022\u2022" onKeyDown={e=>e.key==="Enter"&&submit()}/>
+          </div>
+          {err && <div style={{fontSize:12,color:"#f87171",background:"#7f1d1d22",border:"1px solid #7f1d1d44",borderRadius:8,padding:"8px 10px"}}>{err}</div>}
+          <div style={{fontSize:11,color:"#f59e0b",background:"#78350f22",border:"1px solid #78350f44",borderRadius:8,padding:"10px 12px",lineHeight:1.5}}>
+            {"\u26A0\uFE0F"} Als je je PIN vergeet kun je je data niet meer terugzien. Maak regelmatig een backup via het instellingenmenu.
+          </div>
+          <button className="submit" onClick={submit} disabled={busy}>{busy ? "Bezig..." : "PIN instellen"}</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ── Lockscreen: unlock with PIN ── */
+function PinLock({ onUnlock, onRestore }) {
+  const [pin, setPin] = useState("");
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const submit = async () => {
+    setErr("");
+    if (!pin) { setErr("Voer je PIN in"); return; }
+    setBusy(true);
+    try {
+      await onUnlock(pin);
+    } catch(e) {
+      setErr(e.message || "Ontgrendelen mislukt");
+      setPin("");
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div style={{height:"100vh",display:"flex",alignItems:"center",justifyContent:"center",padding:"24px",background:"#060d1a"}}>
+      <div className="card" style={{padding:24,maxWidth:360,width:"100%"}}>
+        <div style={{textAlign:"center",marginBottom:18}}>
+          <div style={{fontSize:38,marginBottom:6}}>{"\u{1F4B0}"}</div>
+          <h2 style={{fontFamily:"'DM Serif Display',serif",fontSize:22,fontWeight:400,color:"#f8fafc"}}>Mijn Financien</h2>
+          <p style={{fontSize:12,color:"#475569",marginTop:6}}>Voer je PIN in om te ontgrendelen</p>
+        </div>
+        <div style={{display:"flex",flexDirection:"column",gap:12}}>
+          <div>
+            <label style={LS}>PIN</label>
+            <input className="fi" type="password" inputMode="numeric" pattern="[0-9]*" autoFocus autoComplete="current-password" value={pin} onChange={e=>setPin(e.target.value)} placeholder="\u2022\u2022\u2022\u2022" onKeyDown={e=>e.key==="Enter"&&submit()}/>
+          </div>
+          {err && <div style={{fontSize:12,color:"#f87171",background:"#7f1d1d22",border:"1px solid #7f1d1d44",borderRadius:8,padding:"8px 10px"}}>{err}</div>}
+          <button className="submit" onClick={submit} disabled={busy}>{busy ? "Bezig..." : "Ontgrendelen"}</button>
+          <label style={{background:"#1a2744",borderRadius:9,color:"#94a3b8",cursor:"pointer",padding:"11px",fontSize:13,fontFamily:"inherit",textAlign:"center",display:"block"}}>
+            {"\u{1F4E4}"} Herstel van backup
+            <input type="file" accept=".json" onChange={onRestore} style={{display:"none"}} />
+          </label>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ── Change PIN dialog (shown from settings) ── */
+function ChangePinDialog({ onClose, onChange }) {
+  const [oldPin, setOldPin] = useState("");
+  const [newPin, setNewPin] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const submit = async () => {
+    setErr("");
+    if (newPin.length < 4) { setErr("Nieuwe PIN moet minstens 4 cijfers zijn"); return; }
+    if (newPin !== confirm) { setErr("Nieuwe PIN's komen niet overeen"); return; }
+    setBusy(true);
+    try {
+      await onChange(oldPin, newPin);
+      onClose();
+    } catch(e) {
+      setErr(e.message || "Wijzigen mislukt");
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="overlay" onClick={onClose}>
+      <div className="dialog" onClick={e=>e.stopPropagation()}>
+        <h3 style={{fontSize:15,fontWeight:700,marginBottom:14}}>PIN wijzigen</h3>
+        <div style={{display:"flex",flexDirection:"column",gap:12}}>
+          <div>
+            <label style={LS}>Huidige PIN</label>
+            <input className="fi" type="password" inputMode="numeric" pattern="[0-9]*" autoComplete="current-password" value={oldPin} onChange={e=>setOldPin(e.target.value)}/>
+          </div>
+          <div>
+            <label style={LS}>Nieuwe PIN</label>
+            <input className="fi" type="password" inputMode="numeric" pattern="[0-9]*" autoComplete="new-password" value={newPin} onChange={e=>setNewPin(e.target.value)}/>
+          </div>
+          <div>
+            <label style={LS}>Bevestig nieuwe PIN</label>
+            <input className="fi" type="password" inputMode="numeric" pattern="[0-9]*" autoComplete="new-password" value={confirm} onChange={e=>setConfirm(e.target.value)}/>
+          </div>
+          {err && <div style={{fontSize:12,color:"#f87171",background:"#7f1d1d22",border:"1px solid #7f1d1d44",borderRadius:8,padding:"8px 10px"}}>{err}</div>}
+        </div>
+        <div style={{display:"flex",gap:8,marginTop:14}}>
+          <button onClick={onClose} style={{flex:1,background:"#1a2744",border:"none",borderRadius:9,color:"#94a3b8",cursor:"pointer",padding:"11px",fontSize:14,fontFamily:"inherit"}}>Annuleren</button>
+          <button onClick={submit} disabled={busy} style={{flex:1,background:"linear-gradient(135deg,#3b82f6,#2563eb)",border:"none",borderRadius:9,color:"#fff",cursor:"pointer",padding:"11px",fontSize:14,fontWeight:600,fontFamily:"inherit",opacity:busy?0.6:1}}>{busy?"Bezig...":"Opslaan"}</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 /* ══════════════════════════════════════════════════════════════════════ */
 /*                          MAIN APP COMPONENT                          */
 /* ══════════════════════════════════════════════════════════════════════ */
 function App() {
-  /* ── Load data synchronously from localStorage ── */
-  const initTx   = () => { const d = storageGet(KEY_TX, null);   return (Array.isArray(d) && d.length > 0) ? d : DEMO_TX; };
-  const initCats = () => { const d = storageGet(KEY_CATS, null); return (Array.isArray(d) && d.length > 0 && d[0].id) ? d : DEFAULT_CATS; };
+  /* ── Boot state: "loading" | "setup" | "locked" | "ready" ── */
+  const [bootState, setBootState] = useState("loading");
+  const [cryptoKey, setCryptoKey] = useState(null);
+  const [saltBytes, setSaltBytes] = useState(null);
 
-  const [tx,       setTx]      = useState(initTx);
-  const [cats,     setCats]    = useState(initCats);
+  const [tx,       setTx]      = useState([]);
+  const [cats,     setCats]    = useState(DEFAULT_CATS);
   const [saveOk,   setSaveOk]  = useState(null);
   const [view,     setView]    = useState("dashboard");
   const [form,     setForm]    = useState(blankForm);
@@ -240,20 +406,108 @@ function App() {
   const [modal,    setModal]   = useState(null);
   const [catForm,  setCatForm] = useState({ label:"", icon:"\u{1F3F7}\uFE0F", color:"#6366f1", budget:0, isIncome:false });
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [changePinOpen, setChangePinOpen] = useState(false);
 
-  /* ── Save helpers with visual feedback ── */
-  const saveTxData = useCallback((data) => {
-    storageSet(KEY_TX, data);
-    setSaveOk(true);
-    setTimeout(() => setSaveOk(null), 1500);
+  /* ── Boot: request persistent storage, check if PIN is set ── */
+  useEffect(() => {
+    if (navigator.storage && navigator.storage.persist) {
+      navigator.storage.persist().catch(()=>{});
+    }
+    const hasInit = localStorage.getItem(KEY_INIT);
+    setBootState(hasInit ? "locked" : "setup");
   }, []);
 
-  const saveCatData = useCallback((data) => {
-    storageSet(KEY_CATS, data);
-  }, []);
+  /* ── Encrypted persist ── */
+  const persist = useCallback((nextTx, nextCats) => {
+    if (!cryptoKey) return;
+    encryptJSON(cryptoKey, { tx: nextTx, cats: nextCats })
+      .then(blob => {
+        try {
+          localStorage.setItem(KEY_BLOB, JSON.stringify(blob));
+          setSaveOk(true);
+          setTimeout(() => setSaveOk(null), 1500);
+        } catch(e) {
+          console.error("Storage write error:", e);
+          alert("Kon niet opslaan: " + e.message);
+        }
+      })
+      .catch(e => {
+        console.error("Encrypt error:", e);
+        alert("Versleutelen mislukt: " + e.message);
+      });
+  }, [cryptoKey]);
 
-  const setAndSaveTx   = (d) => { setTx(d);   saveTxData(d);   };
-  const setAndSaveCats = (d) => { setCats(d);  saveCatData(d);  };
+  const setAndSaveTx   = (d) => { setTx(d);   persist(d, cats); };
+  const setAndSaveCats = (d) => { setCats(d); persist(tx, d);   };
+
+  /* ── PIN setup: first launch ── */
+  const completeSetup = async (pin) => {
+    const salt = randomBytes(16);
+    const key  = await deriveKey(pin, salt);
+    const check = await encryptString(key, CHECK_PLAINTEXT);
+    const initialTx = [];
+    const initialCats = DEFAULT_CATS;
+    const blob = await encryptJSON(key, { tx: initialTx, cats: initialCats });
+    localStorage.setItem(KEY_SALT,  b64encode(salt));
+    localStorage.setItem(KEY_CHECK, JSON.stringify(check));
+    localStorage.setItem(KEY_BLOB,  JSON.stringify(blob));
+    localStorage.setItem(KEY_INIT,  "1");
+    setSaltBytes(salt);
+    setCryptoKey(key);
+    setTx(initialTx);
+    setCats(initialCats);
+    setBootState("ready");
+  };
+
+  /* ── PIN unlock: open encrypted blob ── */
+  const tryUnlock = async (pin) => {
+    const saltB64 = localStorage.getItem(KEY_SALT);
+    const checkRaw = localStorage.getItem(KEY_CHECK);
+    if (!saltB64 || !checkRaw) throw new Error("Geen opslag gevonden");
+    const salt = b64decode(saltB64);
+    const key  = await deriveKey(pin, salt);
+    // Verify PIN by decrypting the check blob
+    const plain = await decryptString(key, JSON.parse(checkRaw));
+    if (plain !== CHECK_PLAINTEXT) throw new Error("Verkeerde PIN");
+    // Decrypt the data blob
+    const blobRaw = localStorage.getItem(KEY_BLOB);
+    if (!blobRaw) {
+      setSaltBytes(salt);
+      setCryptoKey(key);
+      setTx([]);
+      setCats(DEFAULT_CATS);
+      setBootState("ready");
+      return;
+    }
+    const data = await decryptJSON(key, JSON.parse(blobRaw));
+    setSaltBytes(salt);
+    setCryptoKey(key);
+    setTx(Array.isArray(data.tx) ? data.tx : []);
+    setCats(Array.isArray(data.cats) && data.cats.length > 0 ? data.cats : DEFAULT_CATS);
+    setBootState("ready");
+  };
+
+  /* ── Change PIN: re-encrypt blob + check with new key ── */
+  const changePin = async (oldPin, newPin) => {
+    const saltB64 = localStorage.getItem(KEY_SALT);
+    if (!saltB64) throw new Error("Geen opslag gevonden");
+    const oldSalt = b64decode(saltB64);
+    const oldKey  = await deriveKey(oldPin, oldSalt);
+    // Verify old PIN
+    const checkRaw = localStorage.getItem(KEY_CHECK);
+    const plain = await decryptString(oldKey, JSON.parse(checkRaw));
+    if (plain !== CHECK_PLAINTEXT) throw new Error("Verkeerde huidige PIN");
+    // Derive new key with fresh salt and re-encrypt everything
+    const newSalt = randomBytes(16);
+    const newKey  = await deriveKey(newPin, newSalt);
+    const newCheck = await encryptString(newKey, CHECK_PLAINTEXT);
+    const newBlob  = await encryptJSON(newKey, { tx, cats });
+    localStorage.setItem(KEY_SALT,  b64encode(newSalt));
+    localStorage.setItem(KEY_CHECK, JSON.stringify(newCheck));
+    localStorage.setItem(KEY_BLOB,  JSON.stringify(newBlob));
+    setSaltBytes(newSalt);
+    setCryptoKey(newKey);
+  };
 
   /* ── Category helpers ── */
   const getCat      = (id) => cats.find(c => c.id === id) || { id:"overig", label:"Overig", icon:"\u{1F4E6}", color:"#94a3b8", budget:100, isIncome:false };
@@ -273,8 +527,11 @@ function App() {
   };
 
   const deleteCat = (id) => {
-    setAndSaveCats(cats.filter(c => c.id !== id));
-    setAndSaveTx(tx.map(t => t.category === id ? { ...t, category:"overig" } : t));
+    const newCats = cats.filter(c => c.id !== id);
+    const newTx   = tx.map(t => t.category === id ? { ...t, category:"overig" } : t);
+    setCats(newCats);
+    setTx(newTx);
+    persist(newTx, newCats);
   };
 
   /* ── Transaction helpers ── */
@@ -303,41 +560,148 @@ function App() {
   const goView   = (v) => { setEditId(null); setForm(blankForm()); setView(v); };
 
   /* ── Data export/import ── */
-  const exportData = () => {
-    const data = { version:1, exportDate:new Date().toISOString(), transactions:tx, categories:cats };
-    const blob = new Blob([JSON.stringify(data, null, 2)], { type:"application/json" });
+  const downloadJSON = (obj, filename) => {
+    const blob = new Blob([JSON.stringify(obj, null, 2)], { type:"application/json" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = "financien-backup-"+new Date().toISOString().slice(0,10)+".json";
+    a.download = filename;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
   };
 
+  const exportEncrypted = async () => {
+    if (!cryptoKey || !saltBytes) return;
+    try {
+      const payload = await encryptJSON(cryptoKey, { tx, cats });
+      const file = {
+        version: 2,
+        encrypted: true,
+        exportDate: new Date().toISOString(),
+        salt: b64encode(saltBytes),
+        iterations: PBKDF2_ITER,
+        iv: payload.iv,
+        ct: payload.ct,
+      };
+      downloadJSON(file, "financien-backup-"+new Date().toISOString().slice(0,10)+".json");
+    } catch(e) {
+      alert("Exporteren mislukt: " + e.message);
+    }
+  };
+
+  const exportPlaintext = () => {
+    if (!confirm("LET OP: Deze export bevat je gegevens onversleuteld. Bewaar het bestand op een veilige plek. Doorgaan?")) return;
+    const data = { version:1, encrypted:false, exportDate:new Date().toISOString(), transactions:tx, categories:cats };
+    downloadJSON(data, "financien-backup-plaintext-"+new Date().toISOString().slice(0,10)+".json");
+  };
+
   const importData = (e) => {
     const file = e.target.files[0];
+    e.target.value = ""; // reset so same file can be re-selected
     if (!file) return;
     const reader = new FileReader();
-    reader.onload = (ev) => {
+    reader.onload = async (ev) => {
       try {
         const data = JSON.parse(ev.target.result);
-        if (data.transactions && Array.isArray(data.transactions)) setAndSaveTx(data.transactions);
-        if (data.categories && Array.isArray(data.categories)) setAndSaveCats(data.categories);
-        setSettingsOpen(false);
+        if (data.encrypted || data.version === 2) {
+          // Encrypted backup: prompt for PIN used at backup time
+          const pin = prompt("Voer de PIN in die bij deze backup hoort:");
+          if (!pin) return;
+          const salt = b64decode(data.salt);
+          const key  = await deriveKey(pin, salt);
+          const payload = await decryptJSON(key, { iv:data.iv, ct:data.ct });
+          if (!Array.isArray(payload.tx) || !Array.isArray(payload.cats)) throw new Error("Ongeldige backup-inhoud");
+          setTx(payload.tx);
+          setCats(payload.cats);
+          persist(payload.tx, payload.cats);
+          setSettingsOpen(false);
+          alert("Backup hersteld (" + payload.tx.length + " transacties).");
+        } else {
+          // Plaintext backup
+          const newTx   = Array.isArray(data.transactions) ? data.transactions : tx;
+          const newCats = Array.isArray(data.categories) && data.categories.length > 0 ? data.categories : cats;
+          setTx(newTx);
+          setCats(newCats);
+          persist(newTx, newCats);
+          setSettingsOpen(false);
+          alert("Backup hersteld.");
+        }
       } catch(err) {
-        alert("Ongeldig bestand: " + err.message);
+        alert("Kon backup niet herstellen: " + (err.message || "ongeldig bestand of verkeerde PIN"));
+      }
+    };
+    reader.readAsText(file);
+  };
+
+  /* ── Restore from lockscreen (no cryptoKey yet) ── */
+  const restoreFromLockscreen = (e) => {
+    const file = e.target.files[0];
+    e.target.value = "";
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = async (ev) => {
+      try {
+        const data = JSON.parse(ev.target.result);
+        if (!(data.encrypted || data.version === 2)) {
+          if (!confirm("Dit is een onversleutelde backup. Na herstel wordt je gevraagd om een nieuwe PIN in te stellen. Doorgaan?")) return;
+          const newPin = prompt("Kies een nieuwe PIN (min. 4 cijfers):");
+          if (!newPin || newPin.length < 4) { alert("PIN te kort"); return; }
+          const salt = randomBytes(16);
+          const key  = await deriveKey(newPin, salt);
+          const check = await encryptString(key, CHECK_PLAINTEXT);
+          const payloadTx   = Array.isArray(data.transactions) ? data.transactions : [];
+          const payloadCats = Array.isArray(data.categories) && data.categories.length > 0 ? data.categories : DEFAULT_CATS;
+          const blob = await encryptJSON(key, { tx: payloadTx, cats: payloadCats });
+          localStorage.setItem(KEY_SALT,  b64encode(salt));
+          localStorage.setItem(KEY_CHECK, JSON.stringify(check));
+          localStorage.setItem(KEY_BLOB,  JSON.stringify(blob));
+          localStorage.setItem(KEY_INIT,  "1");
+          setSaltBytes(salt);
+          setCryptoKey(key);
+          setTx(payloadTx);
+          setCats(payloadCats);
+          setBootState("ready");
+          return;
+        }
+        const pin = prompt("Voer de PIN in die bij deze backup hoort:");
+        if (!pin) return;
+        const salt = b64decode(data.salt);
+        const key  = await deriveKey(pin, salt);
+        const payload = await decryptJSON(key, { iv:data.iv, ct:data.ct });
+        if (!Array.isArray(payload.tx) || !Array.isArray(payload.cats)) throw new Error("Ongeldige backup-inhoud");
+        // Reuse backup's salt so the restored PIN is the PIN from the backup
+        const check = await encryptString(key, CHECK_PLAINTEXT);
+        const blob  = await encryptJSON(key, { tx: payload.tx, cats: payload.cats });
+        localStorage.setItem(KEY_SALT,  b64encode(salt));
+        localStorage.setItem(KEY_CHECK, JSON.stringify(check));
+        localStorage.setItem(KEY_BLOB,  JSON.stringify(blob));
+        localStorage.setItem(KEY_INIT,  "1");
+        setSaltBytes(salt);
+        setCryptoKey(key);
+        setTx(payload.tx);
+        setCats(payload.cats);
+        setBootState("ready");
+      } catch(err) {
+        alert("Kon backup niet herstellen: " + (err.message || "ongeldig bestand of verkeerde PIN"));
       }
     };
     reader.readAsText(file);
   };
 
   const clearAllData = () => {
-    if (confirm("Weet je zeker dat je ALLE gegevens wilt wissen? Dit kan niet ongedaan worden gemaakt.")) {
-      setAndSaveTx([]);
-      setAndSaveCats(DEFAULT_CATS);
+    if (confirm("Weet je zeker dat je ALLE gegevens wilt wissen? Dit kan niet ongedaan worden gemaakt. Daarna moet je een nieuwe PIN kiezen.")) {
+      localStorage.removeItem(KEY_BLOB);
+      localStorage.removeItem(KEY_SALT);
+      localStorage.removeItem(KEY_CHECK);
+      localStorage.removeItem(KEY_INIT);
+      setCryptoKey(null);
+      setSaltBytes(null);
+      setTx([]);
+      setCats(DEFAULT_CATS);
       setSettingsOpen(false);
+      setBootState("setup");
     }
   };
 
@@ -401,6 +765,22 @@ function App() {
   const monthLabel = (m) => { if(!m)return"Alle maanden"; const p=m.split("-"); return MONTHS[parseInt(p[1])-1]+" "+p[0]; };
 
   const formCats = form.type === "uitgave" ? expenseCats : incomeCats;
+
+  /* ── Boot-state gating: show lockscreen before the main UI ── */
+  if (bootState === "loading") {
+    return (
+      <div style={{height:"100vh",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",background:"#060d1a",color:"#475569",gap:12}}>
+        <div style={{fontSize:32}}>{"\u{1F4B0}"}</div>
+        <div style={{fontSize:13,fontFamily:"monospace"}}>Laden...</div>
+      </div>
+    );
+  }
+  if (bootState === "setup") {
+    return <PinSetup onComplete={completeSetup} />;
+  }
+  if (bootState === "locked") {
+    return <PinLock onUnlock={tryUnlock} onRestore={restoreFromLockscreen} />;
+  }
 
   /* ── RENDER ── */
   return (
@@ -480,24 +860,38 @@ function App() {
         </div>
       )}
 
+      {/* Change PIN dialog */}
+      {changePinOpen && (
+        <ChangePinDialog onClose={()=>setChangePinOpen(false)} onChange={changePin} />
+      )}
+
       {/* Settings modal */}
       {settingsOpen && (
         <div className="overlay" onClick={()=>setSettingsOpen(false)}>
           <div className="dialog" onClick={e=>e.stopPropagation()}>
             <h3 style={{fontSize:15,fontWeight:700,marginBottom:16}}>Instellingen</h3>
             <div style={{display:"flex",flexDirection:"column",gap:10}}>
-              <button onClick={exportData} style={{background:"#1a2744",border:"none",borderRadius:9,color:"#e2e8f0",cursor:"pointer",padding:"12px",fontSize:14,fontFamily:"inherit",textAlign:"left"}}>
-                {"\u{1F4E5}"} Exporteer gegevens (JSON)
+              <button onClick={exportEncrypted} style={{background:"#1a2744",border:"none",borderRadius:9,color:"#e2e8f0",cursor:"pointer",padding:"12px",fontSize:14,fontFamily:"inherit",textAlign:"left"}}>
+                {"\u{1F510}"} Exporteer (versleuteld)
+              </button>
+              <button onClick={exportPlaintext} style={{background:"#1a2744",border:"none",borderRadius:9,color:"#94a3b8",cursor:"pointer",padding:"12px",fontSize:13,fontFamily:"inherit",textAlign:"left"}}>
+                {"\u{1F4E5}"} Exporteer (onversleuteld)
               </button>
               <label style={{background:"#1a2744",borderRadius:9,color:"#e2e8f0",cursor:"pointer",padding:"12px",fontSize:14,fontFamily:"inherit",textAlign:"left",display:"block"}}>
                 {"\u{1F4E4}"} Importeer gegevens
                 <input type="file" accept=".json" onChange={importData} style={{display:"none"}} />
               </label>
+              <button onClick={()=>{setSettingsOpen(false);setChangePinOpen(true);}} style={{background:"#1a2744",border:"none",borderRadius:9,color:"#e2e8f0",cursor:"pointer",padding:"12px",fontSize:14,fontFamily:"inherit",textAlign:"left"}}>
+                {"\u{1F511}"} PIN wijzigen
+              </button>
+              <button onClick={()=>{setCryptoKey(null);setTx([]);setCats(DEFAULT_CATS);setSettingsOpen(false);setBootState("locked");}} style={{background:"#1a2744",border:"none",borderRadius:9,color:"#e2e8f0",cursor:"pointer",padding:"12px",fontSize:14,fontFamily:"inherit",textAlign:"left"}}>
+                {"\u{1F512}"} Vergrendel nu
+              </button>
               <button onClick={clearAllData} style={{background:"#7f1d1d22",border:"1px solid #7f1d1d",borderRadius:9,color:"#ef4444",cursor:"pointer",padding:"12px",fontSize:14,fontFamily:"inherit",textAlign:"left"}}>
                 {"\u{1F5D1}\uFE0F"} Wis alle gegevens
               </button>
               <div style={{fontSize:11,color:"#334155",marginTop:4,lineHeight:1.5}}>
-                Je gegevens worden lokaal opgeslagen op dit toestel. Maak regelmatig een backup via exporteren.
+                Je gegevens worden versleuteld lokaal opgeslagen op dit toestel. Zonder je PIN is niets leesbaar. Maak regelmatig een backup (versleuteld) voor het geval je je telefoon kwijtraakt.
               </div>
             </div>
             <button onClick={()=>setSettingsOpen(false)} style={{width:"100%",background:"#1a2744",border:"none",borderRadius:9,color:"#94a3b8",cursor:"pointer",padding:"11px",fontSize:14,fontFamily:"inherit",marginTop:14}}>Sluiten</button>
