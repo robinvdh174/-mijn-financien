@@ -2,7 +2,7 @@
 <html lang="nl">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1, user-scalable=no">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <title>Mijn Financien</title>
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
@@ -124,9 +124,20 @@ const PRESET_ICONS  = ["\u{1F3E0}","\u{1F6D2}","\u{1F697}","\u26A1","\u{1F37D}\u
 const MONTHS = ["Jan","Feb","Mrt","Apr","Mei","Jun","Jul","Aug","Sep","Okt","Nov","Dec"];
 
 const fmt     = (n) => new Intl.NumberFormat("nl-BE",{style:"currency",currency:"EUR"}).format(n);
-const fmtDate = (iso) => new Date(iso).toLocaleDateString("nl-BE",{day:"2-digit",month:"short",year:"numeric"});
-const nowKey  = () => { const d=new Date(); return d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0"); };
-const uid     = () => "cat_"+Date.now()+"_"+Math.random().toString(36).slice(2,6);
+const fmtDate = (iso) => {
+  const [y,m,d] = String(iso).split("-").map(Number);
+  if (!y||!m||!d) return iso;
+  return new Date(y, m-1, d).toLocaleDateString("nl-BE",{day:"2-digit",month:"short",year:"numeric"});
+};
+const nowKey      = () => { const d=new Date(); return d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0"); };
+const todayKey    = () => { const d=new Date(); return d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")+"-"+String(d.getDate()).padStart(2,"0"); };
+const uid         = (prefix) => (prefix||"id")+"_"+Date.now().toString(36)+"_"+Math.random().toString(36).slice(2,8);
+const parseAmount = (s) => {
+  if (typeof s === "number") return s;
+  const cleaned = String(s).replace(/\s/g,"").replace(",",".");
+  const v = parseFloat(cleaned);
+  return isNaN(v) ? NaN : v;
+};
 
 const DEMO_TX = [
   {id:1,  date:"2026-03-01",description:"Loon maart",         category:"inkomen",      amount: 3200  },
@@ -146,7 +157,7 @@ const DEMO_TX = [
 ];
 
 function blankForm() {
-  return { date:new Date().toISOString().slice(0,10), description:"", category:"overig", amount:"", type:"uitgave" };
+  return { date:todayKey(), description:"", category:"overig", amount:"", type:"uitgave" };
 }
 
 /* ── Custom chart components (no Recharts dependency) ── */
@@ -211,8 +222,8 @@ function TRow({ t, cat, onEdit, onDelete }) {
       <span style={{fontSize:13,fontWeight:700,color:t.amount>0?"#22c55e":"#f87171",minWidth:68,textAlign:"right",flexShrink:0}}>
         {t.amount>0?"+":""}{fmt(t.amount)}
       </span>
-      <button className="rb" onClick={()=>onEdit(t)}>&#9998;</button>
-      <button className="rb" onClick={()=>onDelete(t.id)}>&#128465;</button>
+      <button className="rb" aria-label="Bewerken" onClick={()=>onEdit(t)}>&#9998;</button>
+      <button className="rb" aria-label="Verwijderen" onClick={()=>onDelete(t.id)}>&#128465;</button>
     </div>
   );
 }
@@ -233,10 +244,14 @@ function App() {
   const [view,     setView]    = useState("dashboard");
   const [form,     setForm]    = useState(blankForm);
   const [editId,   setEditId]  = useState(null);
-  const [fMonth,   setFMonth]  = useState(null);
+  const [fMonth,   setFMonth]  = useState(() => nowKey());
+  const [fCat,     setFCat]    = useState(null);
   const [search,   setSearch]  = useState("");
   const [sortBy,   setSortBy]  = useState("date");
   const [delConf,  setDelConf] = useState(null);
+  const [catDelConf, setCatDelConf] = useState(null);
+  const [clearConf, setClearConf] = useState(false);
+  const [importErr, setImportErr] = useState(null);
   const [modal,    setModal]   = useState(null);
   const [catForm,  setCatForm] = useState({ label:"", icon:"\u{1F3F7}\uFE0F", color:"#6366f1", budget:0, isIncome:false });
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -250,6 +265,8 @@ function App() {
 
   const saveCatData = useCallback((data) => {
     storageSet(KEY_CATS, data);
+    setSaveOk(true);
+    setTimeout(() => setSaveOk(null), 1500);
   }, []);
 
   const setAndSaveTx   = (d) => { setTx(d);   saveTxData(d);   };
@@ -266,29 +283,41 @@ function App() {
   const saveCat = () => {
     if (!catForm.label.trim()) return;
     const next = modal === "addCat"
-      ? [...cats, { id:uid(), ...catForm }]
+      ? [...cats, { id:uid("cat"), ...catForm }]
       : cats.map(c => c.id === modal ? { ...c, ...catForm } : c);
     setAndSaveCats(next);
     setModal(null);
   };
 
   const deleteCat = (id) => {
-    setAndSaveCats(cats.filter(c => c.id !== id));
-    setAndSaveTx(tx.map(t => t.category === id ? { ...t, category:"overig" } : t));
+    const remaining = cats.filter(c => c.id !== id);
+    const removed   = cats.find(c => c.id === id);
+    const fallback  = remaining.find(c => !c.isIncome === !(removed && removed.isIncome))?.id
+                   || remaining[0]?.id
+                   || "overig";
+    setAndSaveCats(remaining);
+    setAndSaveTx(tx.map(t => t.category === id ? { ...t, category:fallback } : t));
+    if (fCat === id) setFCat(null);
+  };
+
+  const confirmDeleteCat = (id) => {
+    const used = tx.filter(t => t.category === id).length;
+    setCatDelConf({ id, used });
   };
 
   /* ── Transaction helpers ── */
   const handleSubmit = () => {
-    if (!form.description.trim() || !form.amount) return;
-    const val = parseFloat(String(form.amount).replace(",","."));
+    if (!form.description.trim() || form.amount === "" || form.amount == null) return;
+    const val = parseAmount(form.amount);
     if (isNaN(val) || val <= 0) return;
+    if (!form.date || !/^\d{4}-\d{2}-\d{2}$/.test(form.date)) return;
     const signed = form.type === "uitgave" ? -Math.abs(val) : Math.abs(val);
-    const entry  = { date:form.date, description:form.description, category:form.category, amount:signed };
+    const entry  = { date:form.date, description:form.description.trim(), category:form.category, amount:signed };
     if (editId !== null) {
       setAndSaveTx(tx.map(t => t.id === editId ? { ...t, ...entry } : t));
       setEditId(null);
     } else {
-      setAndSaveTx([...tx, { id:Date.now(), ...entry }]);
+      setAndSaveTx([...tx, { id:uid("tx"), ...entry }]);
     }
     setForm(blankForm());
     setView("transacties");
@@ -309,7 +338,7 @@ function App() {
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = "financien-backup-"+new Date().toISOString().slice(0,10)+".json";
+    a.download = "financien-backup-"+todayKey()+".json";
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
@@ -319,38 +348,85 @@ function App() {
   const importData = (e) => {
     const file = e.target.files[0];
     if (!file) return;
+    const input = e.target;
     const reader = new FileReader();
     reader.onload = (ev) => {
       try {
         const data = JSON.parse(ev.target.result);
-        if (data.transactions && Array.isArray(data.transactions)) setAndSaveTx(data.transactions);
-        if (data.categories && Array.isArray(data.categories)) setAndSaveCats(data.categories);
+        if (!data || typeof data !== "object") throw new Error("Onbekende structuur");
+        let importedTx = null, importedCats = null;
+        if (Array.isArray(data.transactions)) {
+          importedTx = data.transactions
+            .filter(t => t && typeof t === "object"
+              && typeof t.date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(t.date)
+              && typeof t.description === "string"
+              && typeof t.category === "string"
+              && typeof t.amount === "number" && isFinite(t.amount))
+            .map(t => ({ id: t.id != null ? t.id : uid("tx"),
+                          date:t.date, description:t.description,
+                          category:t.category, amount:t.amount }));
+        }
+        if (Array.isArray(data.categories)) {
+          importedCats = data.categories
+            .filter(c => c && typeof c === "object"
+              && typeof c.id === "string" && typeof c.label === "string"
+              && typeof c.icon === "string" && typeof c.color === "string")
+            .map(c => ({ id:c.id, label:c.label, icon:c.icon, color:c.color,
+                          budget: typeof c.budget === "number" ? c.budget : 0,
+                          isIncome: !!c.isIncome }));
+        }
+        if (!importedTx && !importedCats) throw new Error("Geen geldige transacties of categorieën");
+        if (importedCats && importedCats.length > 0) setAndSaveCats(importedCats);
+        if (importedTx) setAndSaveTx(importedTx);
         setSettingsOpen(false);
       } catch(err) {
-        alert("Ongeldig bestand: " + err.message);
+        setImportErr(err.message || "Kon bestand niet lezen");
+      } finally {
+        input.value = "";
       }
     };
+    reader.onerror = () => { setImportErr("Kon bestand niet lezen"); input.value = ""; };
     reader.readAsText(file);
   };
 
-  const clearAllData = () => {
-    if (confirm("Weet je zeker dat je ALLE gegevens wilt wissen? Dit kan niet ongedaan worden gemaakt.")) {
-      setAndSaveTx([]);
-      setAndSaveCats(DEFAULT_CATS);
-      setSettingsOpen(false);
-    }
+  const doClearAll = () => {
+    setAndSaveTx([]);
+    setAndSaveCats(DEFAULT_CATS);
+    setClearConf(false);
+    setSettingsOpen(false);
+  };
+
+  const exportCSV = () => {
+    const rows = [["Datum","Omschrijving","Categorie","Type","Bedrag"]];
+    [...tx].sort((a,b)=>b.date.localeCompare(a.date)).forEach(t => {
+      const cat = getCat(t.category);
+      const desc = '"' + String(t.description).replace(/"/g,'""') + '"';
+      const amt  = t.amount.toFixed(2).replace(".", ",");
+      rows.push([t.date, desc, cat.label, t.amount < 0 ? "Uitgave" : "Inkomen", amt]);
+    });
+    const csv = rows.map(r => r.join(";")).join("\n");
+    const blob = new Blob(["﻿"+csv], { type:"text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "financien-"+todayKey()+".csv";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
   };
 
   /* ── Computed values ── */
   const availMonths  = useMemo(() => [...new Set(tx.map(t => t.date.slice(0,7)))].sort().reverse(), [tx]);
   const currentMonth = useMemo(() => nowKey(), []);
-  const activeMonth  = fMonth || currentMonth;
-  const monthTs      = useMemo(() => tx.filter(t => t.date.startsWith(activeMonth)), [tx, activeMonth]);
-  const monthIn      = useMemo(() => monthTs.filter(t=>t.amount>0).reduce((s,t)=>s+t.amount,0), [monthTs]);
-  const monthUt      = useMemo(() => monthTs.filter(t=>t.amount<0).reduce((s,t)=>s+Math.abs(t.amount),0), [monthTs]);
+  const scopeTs      = useMemo(() => fMonth ? tx.filter(t => t.date.startsWith(fMonth)) : tx, [tx, fMonth]);
+  const monthIn      = useMemo(() => scopeTs.filter(t=>t.amount>0).reduce((s,t)=>s+t.amount,0), [scopeTs]);
+  const monthUt      = useMemo(() => scopeTs.filter(t=>t.amount<0).reduce((s,t)=>s+Math.abs(t.amount),0), [scopeTs]);
   const monthNt      = monthIn - monthUt;
   const spaar        = monthIn > 0 ? Math.round((monthNt/monthIn)*100) : 0;
   const totSaldo     = useMemo(() => tx.reduce((s,t)=>s+t.amount,0), [tx]);
+  const budgetMonth  = fMonth || currentMonth;
+  const budgetTs     = useMemo(() => tx.filter(t => t.date.startsWith(budgetMonth)), [tx, budgetMonth]);
 
   const biggestExpense = useMemo(() => {
     const ex = tx.filter(t=>t.amount<0);
@@ -359,15 +435,15 @@ function App() {
 
   const pieData = useMemo(() => expenseCats.map(c => ({
     name:c.label, icon:c.icon, color:c.color,
-    value:monthTs.filter(t=>t.category===c.id&&t.amount<0).reduce((s,t)=>s+Math.abs(t.amount),0)
-  })).filter(d=>d.value>0), [monthTs, expenseCats]);
+    value:scopeTs.filter(t=>t.category===c.id&&t.amount<0).reduce((s,t)=>s+Math.abs(t.amount),0)
+  })).filter(d=>d.value>0), [scopeTs, expenseCats]);
 
   const budgetRows = useMemo(() => expenseCats.map(c => {
-    const spent  = monthTs.filter(t=>t.category===c.id&&t.amount<0).reduce((s,t)=>s+Math.abs(t.amount),0);
+    const spent  = budgetTs.filter(t=>t.category===c.id&&t.amount<0).reduce((s,t)=>s+Math.abs(t.amount),0);
     const budget = c.budget || 0;
     const pct    = budget>0 ? Math.min(100,Math.round((spent/budget)*100)) : 0;
     return { ...c, spent:spent, pct:pct, over:budget>0&&spent>budget };
-  }).filter(c=>c.spent>0||c.budget>0), [monthTs, expenseCats]);
+  }).filter(c=>c.spent>0||c.budget>0), [budgetTs, expenseCats]);
 
   const trendData = useMemo(() => {
     const now = new Date();
@@ -385,22 +461,38 @@ function App() {
 
   const filtered = useMemo(()=>{
     let ts = fMonth ? tx.filter(t=>t.date.startsWith(fMonth)) : tx;
+    if (fCat) ts = ts.filter(t => t.category === fCat);
     if (search.trim()) {
       const q=search.toLowerCase();
       ts=ts.filter(t=>t.description.toLowerCase().includes(q)||getCat(t.category).label.toLowerCase().includes(q));
     }
     return ts;
-  },[tx,fMonth,search,cats]);
+  },[tx,fMonth,fCat,search,cats]);
 
   const sorted = useMemo(()=>[...filtered].sort((a,b)=>{
     if (sortBy==="date")   return b.date.localeCompare(a.date);
     if (sortBy==="amount") return Math.abs(b.amount)-Math.abs(a.amount);
-    return a.category.localeCompare(b.category);
-  }),[filtered,sortBy]);
+    return getCat(a.category).label.localeCompare(getCat(b.category).label);
+  }),[filtered,sortBy,cats]);
 
   const monthLabel = (m) => { if(!m)return"Alle maanden"; const p=m.split("-"); return MONTHS[parseInt(p[1])-1]+" "+p[0]; };
 
   const formCats = form.type === "uitgave" ? expenseCats : incomeCats;
+
+  /* ── Keyboard: ESC closes modals ── */
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.key !== "Escape") return;
+      if (importErr) { setImportErr(null); return; }
+      if (clearConf) { setClearConf(false); return; }
+      if (catDelConf) { setCatDelConf(null); return; }
+      if (delConf) { setDelConf(null); return; }
+      if (modal) { setModal(null); return; }
+      if (settingsOpen) { setSettingsOpen(false); return; }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [modal, delConf, catDelConf, clearConf, settingsOpen, importErr]);
 
   /* ── RENDER ── */
   return (
@@ -420,6 +512,56 @@ function App() {
               <button onClick={()=>setDelConf(null)} style={{flex:1,background:"#1a2744",border:"none",borderRadius:9,color:"#94a3b8",cursor:"pointer",padding:"11px",fontSize:14,fontFamily:"inherit"}}>Annuleren</button>
               <button onClick={doDelete} style={{flex:1,background:"#ef4444",border:"none",borderRadius:9,color:"#fff",cursor:"pointer",padding:"11px",fontSize:14,fontWeight:600,fontFamily:"inherit"}}>Verwijderen</button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Category delete confirmation */}
+      {catDelConf && (
+        <div className="overlay" onClick={()=>setCatDelConf(null)}>
+          <div className="dialog" onClick={e=>e.stopPropagation()} style={{textAlign:"center"}}>
+            <div style={{fontSize:32,marginBottom:10}}>{"\u{1F5D1}️"}</div>
+            <h3 style={{fontSize:16,fontWeight:600,marginBottom:6}}>Categorie verwijderen?</h3>
+            <p style={{fontSize:13,color:"#475569",marginBottom:20,lineHeight:1.5}}>
+              <em style={{color:"#94a3b8"}}>"{cats.find(c=>c.id===catDelConf.id)?.label}"</em><br/>
+              {catDelConf.used>0
+                ? catDelConf.used + " transactie" + (catDelConf.used===1?"":"s") + " worden verplaatst naar een andere categorie."
+                : "Er zijn geen transacties gekoppeld."}
+            </p>
+            <div style={{display:"flex",gap:8}}>
+              <button onClick={()=>setCatDelConf(null)} style={{flex:1,background:"#1a2744",border:"none",borderRadius:9,color:"#94a3b8",cursor:"pointer",padding:"11px",fontSize:14,fontFamily:"inherit"}}>Annuleren</button>
+              <button onClick={()=>{deleteCat(catDelConf.id);setCatDelConf(null);setModal(null);}} style={{flex:1,background:"#ef4444",border:"none",borderRadius:9,color:"#fff",cursor:"pointer",padding:"11px",fontSize:14,fontWeight:600,fontFamily:"inherit"}}>Verwijderen</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Clear all data confirmation */}
+      {clearConf && (
+        <div className="overlay" onClick={()=>setClearConf(false)}>
+          <div className="dialog" onClick={e=>e.stopPropagation()} style={{textAlign:"center"}}>
+            <div style={{fontSize:32,marginBottom:10}}>{"⚠️"}</div>
+            <h3 style={{fontSize:16,fontWeight:600,marginBottom:6}}>Alle gegevens wissen?</h3>
+            <p style={{fontSize:13,color:"#475569",marginBottom:20,lineHeight:1.5}}>
+              Alle transacties worden verwijderd en de categorie&euml;n gereset.<br/>
+              Dit kan niet ongedaan worden gemaakt.
+            </p>
+            <div style={{display:"flex",gap:8}}>
+              <button onClick={()=>setClearConf(false)} style={{flex:1,background:"#1a2744",border:"none",borderRadius:9,color:"#94a3b8",cursor:"pointer",padding:"11px",fontSize:14,fontFamily:"inherit"}}>Annuleren</button>
+              <button onClick={doClearAll} style={{flex:1,background:"#ef4444",border:"none",borderRadius:9,color:"#fff",cursor:"pointer",padding:"11px",fontSize:14,fontWeight:600,fontFamily:"inherit"}}>Wissen</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Import error dialog */}
+      {importErr && (
+        <div className="overlay" onClick={()=>setImportErr(null)}>
+          <div className="dialog" onClick={e=>e.stopPropagation()} style={{textAlign:"center"}}>
+            <div style={{fontSize:32,marginBottom:10}}>{"⚠️"}</div>
+            <h3 style={{fontSize:16,fontWeight:600,marginBottom:6}}>Import mislukt</h3>
+            <p style={{fontSize:13,color:"#475569",marginBottom:20,lineHeight:1.5,wordBreak:"break-word"}}>{importErr}</p>
+            <button onClick={()=>setImportErr(null)} style={{width:"100%",background:"#1a2744",border:"none",borderRadius:9,color:"#e2e8f0",cursor:"pointer",padding:"11px",fontSize:14,fontFamily:"inherit"}}>OK</button>
           </div>
         </div>
       )}
@@ -465,13 +607,13 @@ function App() {
               {!catForm.isIncome && (
                 <div>
                   <label style={LS}>Maandbudget (&euro;)</label>
-                  <input className="fi" type="number" min="0" step="10" placeholder="0" value={catForm.budget} onChange={e=>setCatForm(f=>({...f,budget:parseFloat(e.target.value)||0}))}/>
+                  <input className="fi" type="number" min="0" step="10" placeholder="0" value={catForm.budget||""} onChange={e=>setCatForm(f=>({...f,budget:parseFloat(e.target.value)||0}))}/>
                 </div>
               )}
             </div>
             <div style={{display:"flex",gap:8,marginTop:14}}>
               {modal !== "addCat" && (
-                <button onClick={()=>{deleteCat(modal);setModal(null);}} style={{background:"#7f1d1d22",border:"1px solid #7f1d1d",borderRadius:9,color:"#ef4444",cursor:"pointer",padding:"9px 14px",fontSize:14,fontFamily:"inherit",minHeight:40}}>Wis</button>
+                <button onClick={()=>confirmDeleteCat(modal)} aria-label="Categorie verwijderen" style={{background:"#7f1d1d22",border:"1px solid #7f1d1d",borderRadius:9,color:"#ef4444",cursor:"pointer",padding:"9px 14px",fontSize:14,fontFamily:"inherit",minHeight:40}}>Wis</button>
               )}
               <button onClick={()=>setModal(null)} style={{flex:1,background:"#1a2744",border:"none",borderRadius:9,color:"#94a3b8",cursor:"pointer",padding:"11px",fontSize:14,fontFamily:"inherit"}}>Annuleren</button>
               <button onClick={saveCat} style={{flex:1,background:"linear-gradient(135deg,#3b82f6,#2563eb)",border:"none",borderRadius:9,color:"#fff",cursor:"pointer",padding:"11px",fontSize:14,fontWeight:600,fontFamily:"inherit"}}>Opslaan</button>
@@ -489,11 +631,14 @@ function App() {
               <button onClick={exportData} style={{background:"#1a2744",border:"none",borderRadius:9,color:"#e2e8f0",cursor:"pointer",padding:"12px",fontSize:14,fontFamily:"inherit",textAlign:"left"}}>
                 {"\u{1F4E5}"} Exporteer gegevens (JSON)
               </button>
+              <button onClick={exportCSV} style={{background:"#1a2744",border:"none",borderRadius:9,color:"#e2e8f0",cursor:"pointer",padding:"12px",fontSize:14,fontFamily:"inherit",textAlign:"left"}}>
+                {"\u{1F4CA}"} Exporteer transacties (CSV)
+              </button>
               <label style={{background:"#1a2744",borderRadius:9,color:"#e2e8f0",cursor:"pointer",padding:"12px",fontSize:14,fontFamily:"inherit",textAlign:"left",display:"block"}}>
                 {"\u{1F4E4}"} Importeer gegevens
-                <input type="file" accept=".json" onChange={importData} style={{display:"none"}} />
+                <input type="file" accept=".json,application/json" onChange={importData} style={{display:"none"}} />
               </label>
-              <button onClick={clearAllData} style={{background:"#7f1d1d22",border:"1px solid #7f1d1d",borderRadius:9,color:"#ef4444",cursor:"pointer",padding:"12px",fontSize:14,fontFamily:"inherit",textAlign:"left"}}>
+              <button onClick={()=>setClearConf(true)} style={{background:"#7f1d1d22",border:"1px solid #7f1d1d",borderRadius:9,color:"#ef4444",cursor:"pointer",padding:"12px",fontSize:14,fontFamily:"inherit",textAlign:"left"}}>
                 {"\u{1F5D1}\uFE0F"} Wis alle gegevens
               </button>
               <div style={{fontSize:11,color:"#334155",marginTop:4,lineHeight:1.5}}>
@@ -512,7 +657,7 @@ function App() {
             <div>
               <h1 style={{fontFamily:"'DM Serif Display',serif",fontSize:19,fontWeight:400,color:"#f8fafc",lineHeight:1.2}}>{"\u{1F4B0}"} Mijn Financien</h1>
               <p style={{fontSize:11,color:"#334155",marginTop:1}}>
-                Saldo: <span style={{color:totSaldo>=0?"#22c55e":"#ef4444",fontWeight:700}}>{fmt(totSaldo)}</span>
+                Totaalsaldo: <span style={{color:totSaldo>=0?"#22c55e":"#ef4444",fontWeight:700}}>{fmt(totSaldo)}</span>
               </p>
             </div>
             {saveOk && (
@@ -521,7 +666,7 @@ function App() {
               </span>
             )}
           </div>
-          <button onClick={()=>setSettingsOpen(true)} style={{background:"none",border:"1px solid #1a2744",borderRadius:9,cursor:"pointer",padding:"8px 10px",fontSize:16,color:"#475569",minWidth:40,minHeight:40,display:"flex",alignItems:"center",justifyContent:"center"}}>
+          <button onClick={()=>setSettingsOpen(true)} aria-label="Instellingen openen" style={{background:"none",border:"1px solid #1a2744",borderRadius:9,cursor:"pointer",padding:"8px 10px",fontSize:16,color:"#475569",minWidth:40,minHeight:40,display:"flex",alignItems:"center",justifyContent:"center"}}>
             {"\u2699\uFE0F"}
           </button>
         </div>
@@ -545,6 +690,14 @@ function App() {
         {/* DASHBOARD VIEW */}
         {view==="dashboard" && (
           <div style={{display:"flex",flexDirection:"column",gap:12}}>
+            {tx.length===0 && (
+              <div className="card" style={{padding:"20px 16px",textAlign:"center"}}>
+                <div style={{fontSize:32,marginBottom:8}}>{"\u{1F44B}"}</div>
+                <div style={{fontSize:14,fontWeight:600,marginBottom:4}}>Welkom!</div>
+                <p style={{fontSize:12,color:"#475569",lineHeight:1.5,marginBottom:12}}>Begin met het toevoegen van je eerste transactie om je uitgaven en inkomsten bij te houden.</p>
+                <button onClick={()=>goView("toevoegen")} className="submit" style={{maxWidth:200,margin:"0 auto"}}>+ Transactie toevoegen</button>
+              </div>
+            )}
             <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
               {[
                 {lbl:"Inkomen",    val:fmt(monthIn), color:"#22c55e", icon:"\u{1F4C8}"},
@@ -595,12 +748,14 @@ function App() {
               </div>
             )}
 
-            <div className="card" style={{padding:"14px 16px"}}>
-              <h3 style={{fontSize:11,fontWeight:700,color:"#334155",marginBottom:10,textTransform:"uppercase",letterSpacing:".5px"}}>Trend - 6 maanden</h3>
-              <TrendChart data={trendData} />
-            </div>
+            {tx.length>0 && (
+              <div className="card" style={{padding:"14px 16px"}}>
+                <h3 style={{fontSize:11,fontWeight:700,color:"#334155",marginBottom:10,textTransform:"uppercase",letterSpacing:".5px"}}>Trend - 6 maanden</h3>
+                <TrendChart data={trendData} />
+              </div>
+            )}
 
-            <div className="card" style={{padding:"12px 0"}}>
+            {tx.length>0 && <div className="card" style={{padding:"12px 0"}}>
               <h3 style={{fontSize:11,fontWeight:700,color:"#334155",margin:"0 16px 10px",textTransform:"uppercase",letterSpacing:".5px"}}>Recente transacties</h3>
               {[...tx].sort((a,b)=>b.date.localeCompare(a.date)).slice(0,5).map(t=>(
                 <div key={t.id} className="trow">
@@ -617,7 +772,7 @@ function App() {
               <button onClick={()=>setView("transacties")} style={{background:"none",border:"none",color:"#3b82f6",cursor:"pointer",fontSize:12,margin:"8px 16px 0",padding:0,fontFamily:"inherit"}}>
                 Alle transacties {"\u2192"}
               </button>
-            </div>
+            </div>}
           </div>
         )}
 
@@ -627,13 +782,24 @@ function App() {
             <div style={{display:"flex",gap:8,flexWrap:"wrap",alignItems:"center"}}>
               <div style={{flex:1,minWidth:140,position:"relative"}}>
                 <span style={{position:"absolute",left:10,top:"50%",transform:"translateY(-50%)",color:"#334155",fontSize:13,pointerEvents:"none"}}>{"\u{1F50D}"}</span>
-                <input className="fi" style={{paddingLeft:30}} placeholder="Zoeken..." value={search} onChange={e=>setSearch(e.target.value)}/>
+                <input className="fi" style={{paddingLeft:30,paddingRight:search?34:12}} placeholder="Zoeken..." value={search} onChange={e=>setSearch(e.target.value)}/>
+                {search && (
+                  <button onClick={()=>setSearch("")} aria-label="Zoekopdracht wissen" style={{position:"absolute",right:6,top:"50%",transform:"translateY(-50%)",background:"none",border:"none",color:"#475569",cursor:"pointer",fontSize:14,padding:"4px 8px",lineHeight:1}}>&times;</button>
+                )}
               </div>
               <div style={{display:"flex",gap:4}}>
                 {[["date","Datum"],["amount","Bedrag"],["cat","Cat."]].map(([v,l])=>(
                   <button key={v} className={"srt"+(sortBy===v?" on":"")} onClick={()=>setSortBy(v)}>{l}</button>
                 ))}
               </div>
+            </div>
+            <div style={{display:"flex",gap:6,overflowX:"auto",WebkitOverflowScrolling:"touch",paddingBottom:2}}>
+              <button className={"chip"+(!fCat?" on":"")} onClick={()=>setFCat(null)}>Alle cat.</button>
+              {cats.map(c=>(
+                <button key={c.id} className={"chip"+(fCat===c.id?" on":"")} onClick={()=>setFCat(fCat===c.id?null:c.id)}>
+                  {c.icon} {c.label}
+                </button>
+              ))}
             </div>
             <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
               {[
@@ -650,7 +816,14 @@ function App() {
             <div className="card" style={{padding:"4px 0"}}>
               {sorted.length
                 ? sorted.map(t=><TRow key={t.id} t={t} cat={getCat(t.category)} onEdit={startEdit} onDelete={setDelConf}/>)
-                : <p style={{padding:"24px 16px",color:"#334155",textAlign:"center",fontSize:13}}>Geen transacties gevonden.</p>
+                : (tx.length===0
+                    ? <div style={{padding:"28px 16px",textAlign:"center"}}>
+                        <div style={{fontSize:26,marginBottom:6}}>{"\u{1F4DD}"}</div>
+                        <p style={{color:"#475569",fontSize:13,marginBottom:10}}>Nog geen transacties.</p>
+                        <button onClick={()=>goView("toevoegen")} className="submit" style={{maxWidth:220,margin:"0 auto"}}>+ Eerste transactie</button>
+                      </div>
+                    : <p style={{padding:"24px 16px",color:"#334155",textAlign:"center",fontSize:13}}>Geen transacties gevonden voor deze filters.</p>
+                  )
               }
             </div>
           </div>
@@ -684,7 +857,7 @@ function App() {
                 </div>
                 <div>
                   <label style={LS}>Bedrag (&euro;)</label>
-                  <input className="fi" placeholder="0,00" type="number" min="0" step="0.01" inputMode="decimal" value={form.amount} onChange={e=>setForm(f=>({...f,amount:e.target.value}))}/>
+                  <input className="fi" placeholder="0,00" type="text" inputMode="decimal" autoComplete="off" value={form.amount} onChange={e=>setForm(f=>({...f,amount:e.target.value.replace(/[^0-9.,]/g,"")}))}/>
                 </div>
               </div>
               <div>
@@ -730,7 +903,7 @@ function App() {
                   <div style={{display:"flex",alignItems:"center",gap:6}}>
                     {c.over && <span className="tag" style={{background:"#7f1d1d22",color:"#ef4444",border:"1px solid #7f1d1d44",fontSize:10}}>Over</span>}
                     <span style={{fontSize:14,fontWeight:700,color:c.over?"#ef4444":c.pct>80?"#f59e0b":"#22c55e"}}>{c.pct}%</span>
-                    <button className="rb" onClick={()=>openEditCat(c)}>&#9998;</button>
+                    <button className="rb" aria-label="Budget bewerken" onClick={()=>openEditCat(c)}>&#9998;</button>
                   </div>
                 </div>
                 <div className="prbar">
@@ -739,12 +912,16 @@ function App() {
               </div>
             ))}
             {budgetRows.length===0 && <p style={{color:"#334155",fontSize:13,textAlign:"center",padding:30}}>Geen uitgaven in deze periode.</p>}
-            {budgetRows.length>0 && (
+            {budgetRows.length>0 && (() => {
+              const tot = budgetRows.reduce((s,c)=>s+c.budget,0);
+              const sp  = budgetRows.reduce((s,c)=>s+c.spent,0);
+              const rem = tot - sp;
+              return (
               <div style={{background:"linear-gradient(135deg,#0a1428,#0d1627)",border:"1px solid #1e3a5f",borderRadius:12,padding:"14px 16px",display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8}}>
                 {[
-                  {lbl:"Budget",     val:fmt(budgetRows.reduce((s,c)=>s+c.budget,0)),        color:"#60a5fa"},
-                  {lbl:"Uitgegeven", val:fmt(budgetRows.reduce((s,c)=>s+c.spent,0)),          color:"#f87171"},
-                  {lbl:"Resterend",  val:fmt(budgetRows.reduce((s,c)=>s+c.budget-c.spent,0)), color:"#34d399"},
+                  {lbl:"Budget",     val:fmt(tot), color:"#60a5fa"},
+                  {lbl:"Uitgegeven", val:fmt(sp),  color:"#f87171"},
+                  {lbl:"Resterend",  val:fmt(rem), color: rem < 0 ? "#ef4444" : "#34d399"},
                 ].map(s=>(
                   <div key={s.lbl} style={{textAlign:"center"}}>
                     <div style={{fontSize:9,color:"#334155",fontWeight:700,textTransform:"uppercase",letterSpacing:".5px",marginBottom:3}}>{s.lbl}</div>
@@ -752,7 +929,8 @@ function App() {
                   </div>
                 ))}
               </div>
-            )}
+              );
+            })()}
           </div>
         )}
 
@@ -776,7 +954,7 @@ function App() {
                       <div style={{fontSize:11,color:"#475569",marginTop:1}}>Budget: {fmt(c.budget)} / maand</div>
                     </div>
                     <div style={{width:10,height:10,borderRadius:"50%",background:c.color,flexShrink:0}}/>
-                    <button className="rb" onClick={()=>openEditCat(c)}>&#9998;</button>
+                    <button className="rb" aria-label="Categorie bewerken" onClick={()=>openEditCat(c)}>&#9998;</button>
                   </div>
                 ))}
               </div>
@@ -789,7 +967,7 @@ function App() {
                     <span style={{fontSize:20}}>{c.icon}</span>
                     <div style={{flex:1}}><div style={{fontSize:13,fontWeight:600}}>{c.label}</div></div>
                     <div style={{width:10,height:10,borderRadius:"50%",background:c.color,flexShrink:0}}/>
-                    <button className="rb" onClick={()=>openEditCat(c)}>&#9998;</button>
+                    <button className="rb" aria-label="Categorie bewerken" onClick={()=>openEditCat(c)}>&#9998;</button>
                   </div>
                 ))}
               </div>
